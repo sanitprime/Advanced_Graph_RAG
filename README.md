@@ -4,7 +4,7 @@
 
 A comprehensive Graph RAG system that creates structured relationships between Excel and PDF data using AI-powered entity extraction and Neo4j graph database integration.
 
-## 🚀 Quick Start for Judges
+## 🚀 Quick Start for 
 
 ### **Option 1: Web Interface (Recommended)**
 ```bash
@@ -34,14 +34,14 @@ python demo_script.py
 - `requirements.txt` - System dependencies
 
 ### **Demo & Presentation**
-- `demo_script.py` - Professional demo script for judges
+- `demo_script.py` - Professional demo script for
 - `start_web_interface.py` - Easy startup script
 
 ### **Data**
 - `data/excel/` - Excel inventory data (36 rows)
 - `data/pdfs/` - PDF documents (10 invoices)
 
-## 🎯 Key Features for Judges
+## 🎯 Key Features 
 
 ### **1. Advanced Graph RAG (3 Points)**
 - ✅ **Knowledge Graph Database**: Neo4j integration
@@ -59,7 +59,7 @@ python demo_script.py
 - ✅ **AI Responses**: Full Claude integration
 - ✅ **Mobile Ready**: Works on any device
 
-## 🎯 Demo Flow for Judges
+## 🎯 Demo Flow 
 
 ### **1. Introduction (2 minutes)**
 - "Advanced Graph RAG System with Neo4j Integration"
