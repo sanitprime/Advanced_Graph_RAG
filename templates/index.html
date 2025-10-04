@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graph RAG System - Advanced Document Intelligence</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .main-container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            margin: 20px auto;
+            padding: 30px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            color: #2c3e50;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #7f8c8d;
+            font-size: 1.1em;
+        }
+        .query-box {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 30px;
+            border: 2px solid #e9ecef;
+        }
+        .form-control {
+            border-radius: 10px;
+            border: 2px solid #dee2e6;
+            padding: 15px;
+            font-size: 1.1em;
+        }
+        .form-control:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+        }
+        .btn-primary {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            border: none;
+            border-radius: 10px;
+            padding: 15px 30px;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .stats-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .result-box {
+            background: #ffffff;
+            border-radius: 15px;
+            padding: 25px;
+            margin-top: 20px;
+            border-left: 5px solid #667eea;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .relationship-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 10px;
+            margin: 5px 0;
+            border-left: 3px solid #28a745;
+        }
+        .feature-badge {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            margin: 5px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="main-container">
+            <!-- Header -->
+            <div class="header">
+                <h1><i class="fas fa-brain"></i> Graph RAG System</h1>
+                <p>Advanced Document Intelligence with Knowledge Graphs</p>
+                <div class="feature-badges">
+                    <span class="feature-badge"><i class="fas fa-database"></i> Neo4j Integration</span>
+                    <span class="feature-badge"><i class="fas fa-robot"></i> AI-Powered</span>
+                    <span class="feature-badge"><i class="fas fa-project-diagram"></i> Graph Analytics</span>
+                    <span class="feature-badge"><i class="fas fa-search"></i> Semantic Search</span>
+                </div>
+            </div>
+
+            <!-- System Statistics -->
+            <div class="row" id="stats-container">
+                <div class="col-md-12">
+                    <div class="stats-card">
+                        <h4><i class="fas fa-chart-bar"></i> System Statistics</h4>
+                        <div class="row" id="stats-content">
+                            <div class="col-md-3">
+                                <div class="text-center">
+                                    <h5 id="total-nodes">-</h5>
+                                    <small>Total Nodes</small>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="text-center">
+                                    <h5 id="total-edges">-</h5>
+                                    <small>Total Edges</small>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="text-center">
+                                    <h5 id="entity-types">-</h5>
+                                    <small>Entity Types</small>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="text-center">
+                                    <h5 id="relationship-types">-</h5>
+                                    <small>Relationship Types</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Query Interface -->
+            <div class="query-box">
+                <h4><i class="fas fa-question-circle"></i> Ask Your Question</h4>
+                <p class="text-muted">Ask questions about your business data, suppliers, invoices, inventory, and more!</p>
+                
+                <div class="mb-3">
+                    <label for="queryInput" class="form-label">Your Question:</label>
+                    <textarea class="form-control" id="queryInput" rows="3" 
+                              placeholder="e.g., What are the main suppliers and their relationships?"></textarea>
+                </div>
+                
+                <div class="d-grid gap-2">
+                    <button class="btn btn-primary" id="queryBtn" onclick="submitQuery()">
+                        <i class="fas fa-search"></i> Get AI Answer
+                    </button>
+                </div>
+                
+                <!-- Example Queries -->
+                <div class="mt-3">
+                    <small class="text-muted">Try these example queries:</small>
+                    <div class="mt-2">
+                        <button class="btn btn-outline-secondary btn-sm me-2 mb-1" onclick="setQuery('What are the main suppliers and their relationships?')">
+                            Suppliers Analysis
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm me-2 mb-1" onclick="setQuery('Find all GRN documents from 2024')">
+                            GRN Documents
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm me-2 mb-1" onclick="setQuery('Show inventory analysis for stationery items')">
+                            Inventory Analysis
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm me-2 mb-1" onclick="setQuery('What are the business process workflows?')">
+                            Business Workflows
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Results -->
+            <div id="results-container" style="display: none;">
+                <div class="result-box">
+                    <h4><i class="fas fa-lightbulb"></i> AI Answer</h4>
+                    <div id="ai-answer" class="mb-3"></div>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6><i class="fas fa-search"></i> Search Results</h6>
+                            <span class="badge bg-primary" id="num-results">0</span>
+                        </div>
+                        <div class="col-md-6">
+                            <h6><i class="fas fa-link"></i> Relationships</h6>
+                            <span class="badge bg-success" id="num-relationships">0</span>
+                        </div>
+                    </div>
+                    
+                    <div id="relationships-container" class="mt-3"></div>
+                </div>
+            </div>
+
+            <!-- Loading Indicator -->
+            <div id="loading" class="loading" style="display: none;">
+                <div class="spinner"></div>
+                <p class="mt-2">Processing your query with AI...</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Load system statistics on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadStats();
+        });
+
+        function loadStats() {
+            fetch('/api/stats')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('total-nodes').textContent = data.total_nodes || '-';
+                    document.getElementById('total-edges').textContent = data.total_edges || '-';
+                    document.getElementById('entity-types').textContent = Object.keys(data.node_types || {}).length;
+                    document.getElementById('relationship-types').textContent = Object.keys(data.edge_types || {}).length;
+                })
+                .catch(error => {
+                    console.error('Error loading stats:', error);
+                });
+        }
+
+        function setQuery(query) {
+            document.getElementById('queryInput').value = query;
+        }
+
+        function submitQuery() {
+            const query = document.getElementById('queryInput').value.trim();
+            if (!query) {
+                alert('Please enter a question!');
+                return;
+            }
+
+            // Show loading
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results-container').style.display = 'none';
+            document.getElementById('queryBtn').disabled = true;
+
+            // Submit query
+            fetch('/api/query', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ query: query })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    displayResults(data);
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Error processing query: ' + error.message);
+            })
+            .finally(() => {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('queryBtn').disabled = false;
+            });
+        }
+
+        function displayResults(data) {
+            // Show AI answer
+            document.getElementById('ai-answer').innerHTML = formatAnswer(data.answer);
+            
+            // Show statistics
+            document.getElementById('num-results').textContent = data.num_results;
+            document.getElementById('num-relationships').textContent = data.num_relationships;
+            
+            // Show relationships
+            const relationshipsContainer = document.getElementById('relationships-container');
+            if (data.related_documents && data.related_documents.length > 0) {
+                relationshipsContainer.innerHTML = '<h6><i class="fas fa-link"></i> Key Relationships:</h6>' +
+                    data.related_documents.map(rel => 
+                        `<div class="relationship-item">
+                            <strong>${rel.entity_name}</strong> ↔ <strong>${rel.related_entity}</strong>
+                            <br><small class="text-muted">${rel.relationship_type} (Strength: ${rel.relationship_strength})</small>
+                        </div>`
+                    ).join('');
+            } else {
+                relationshipsContainer.innerHTML = '<p class="text-muted">No specific relationships found for this query.</p>';
+            }
+            
+            // Show results
+            document.getElementById('results-container').style.display = 'block';
+        }
+
+        function formatAnswer(answer) {
+            // Simple formatting for better readability
+            return answer.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+        }
+
+        // Allow Enter key to submit query
+        document.getElementById('queryInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submitQuery();
+            }
+        });
+    </script>
+</body>
+</html>
