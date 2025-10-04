@@ -4,7 +4,7 @@
 
 A comprehensive Graph RAG system that creates structured relationships between Excel and PDF data using AI-powered entity extraction and Neo4j graph database integration.
 
-## 🚀 Quick Start for 
+## 🚀 Quick Start 
 
 ### **Option 1: Web Interface (Recommended)**
 ```bash
@@ -34,7 +34,7 @@ python demo_script.py
 - `requirements.txt` - System dependencies
 
 ### **Demo & Presentation**
-- `demo_script.py` - Professional demo script for
+- `demo_script.py` - Professional demo script 
 - `start_web_interface.py` - Easy startup script
 
 ### **Data**
@@ -58,41 +58,4 @@ python demo_script.py
 - ✅ **Real-time Stats**: Live system metrics
 - ✅ **AI Responses**: Full Claude integration
 - ✅ **Mobile Ready**: Works on any device
-
-## 🎯 Demo Flow 
-
-### **1. Introduction (2 minutes)**
-- "Advanced Graph RAG System with Neo4j Integration"
-- "Goes beyond traditional RAG with knowledge graphs"
-- "Multi-modal data fusion with AI-powered relationships"
-
-### **2. Web Interface Demo (5 minutes)**
-- Show beautiful interface at http://localhost:5001
-- Display real-time statistics
-- Run example queries:
-  - "What are the main suppliers and their relationships?"
-  - "Find all GRN documents from 2024"
-  - "Show inventory analysis for stationery items"
-- Show AI responses and relationships
-
-### **3. Technical Excellence (3 minutes)**
-- **Graph Complexity**: 456 nodes, 2605 edges
-- **AI Processing**: Claude-3-Haiku integration
-- **Database**: Neo4j graph database
-- **Scalability**: Enterprise-ready architecture
-
-### **4. Key Innovation (2 minutes)**
-- Multi-modal data integration
-- AI-powered entity extraction
-- Dynamic relationship building
-- Real-time semantic search
-
-## 🏆 Success Metrics
-
-- ✅ **Data Integration**: Excel + PDF fusion
-- ✅ **Graph Analytics**: 456 nodes, 2605 edges
-- ✅ **AI Processing**: Claude-3-Haiku integration
-- ✅ **Database**: Neo4j graph database
-- ✅ **Interface**: Professional web interface
-- ✅ **Scalability**: Enterprise architecture
 
