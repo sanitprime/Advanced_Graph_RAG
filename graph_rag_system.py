@@ -5,6 +5,7 @@ A comprehensive RAG system that creates explicit relationships between Excel inv
 """
 
 import os
+import logging
 import pandas as pd
 import numpy as np
 import json
@@ -19,27 +20,16 @@ from anthropic import Anthropic
 import networkx as nx
 from collections import defaultdict
 from neo4j import GraphDatabase
-import signal
-from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from unicodedata import normalize as ucnorm
 
-def timeout_handler(signum, frame):
-    raise TimeoutError("Operation timed out")
+logger = logging.getLogger(__name__)
 
-def timeout(seconds):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # Set the signal handler
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(seconds)
-            try:
-                result = func(*args, **kwargs)
-                return result
-            finally:
-                signal.alarm(0)
-        return wrapper
-    return decorator
+class Config:
+    CHUNK_SIZE = 1200
+    OVERLAP = 250
+    BM25_K1 = 1.5
+    BM25_B = 0.75
 
 class PDFProcessor:
     """Dynamic PDF processing with AI-powered document type detection and field extraction"""
@@ -67,7 +57,7 @@ class PDFProcessor:
             doc.close()
             return "\n\n".join(text_parts)
         except Exception as e:
-            print(f"Error extracting text from {pdf_path}: {e}")
+            logger.error(f"Error extracting text from {pdf_path}: {e}")
             return ""
     
     def detect_document_type(self, text: str, filename: str) -> str:
@@ -117,7 +107,7 @@ Respond with ONLY the category name, nothing else."""
             doc_type = response.content[0].text.strip().lower()
             return doc_type if doc_type in ['grn', 'invoice', 'purchase_order', 'proforma_invoice', 'quotation', 'delivery_note', 'receipt', 'contract', 'statement', 'other'] else 'unknown'
         except Exception as e:
-            print(f"Error in Claude document type detection: {e}")
+            logger.error(f"Error in Claude document type detection: {e}")
             return 'unknown'
     
     def extract_structured_data(self, text: str, doc_type: str) -> Dict[str, Any]:
@@ -160,46 +150,50 @@ Return ONLY a valid JSON object with the extracted fields. If a field is not fou
         
         for attempt in range(max_retries):
             try:
-                print(f"  Attempting Claude API call (attempt {attempt + 1}/{max_retries})...")
+                logger.info(f"  Attempting Claude API call (attempt {attempt + 1}/{max_retries})...")
                 
                 response = self._claude_api_call_with_timeout(prompt)
                 
                 # Parse JSON response
                 import json
                 structured_data = json.loads(response.content[0].text.strip())
-                print(f"  ✅ Claude extraction successful")
+                logger.info(f"  ✅ Claude extraction successful")
                 return structured_data
                 
             except TimeoutError:
-                print(f"  ⏰ Claude API call timed out (attempt {attempt + 1}/{max_retries})")
+                logger.warning(f"  ⏰ Claude API call timed out (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
-                    print(f"  ⏳ Waiting {retry_delay} seconds before retry...")
+                    logger.info(f"  ⏳ Waiting {retry_delay} seconds before retry...")
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                 else:
-                    print(f"  ❌ All Claude API attempts failed due to timeout")
+                    logger.error(f"  ❌ All Claude API attempts failed due to timeout")
                     
             except Exception as e:
-                print(f"  ❌ Error in Claude field extraction (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"  ❌ Error in Claude field extraction (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    print(f"  ⏳ Waiting {retry_delay} seconds before retry...")
+                    logger.info(f"  ⏳ Waiting {retry_delay} seconds before retry...")
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                 else:
-                    print(f"  ❌ All Claude API attempts failed")
+                    logger.error(f"  ❌ All Claude API attempts failed")
         
         # If all attempts fail, use fallback
-        print(f"  🔄 Falling back to basic field extraction...")
+        logger.info(f"  🔄 Falling back to basic field extraction...")
         return self._extract_basic_fields(text, doc_type)
     
-    @timeout(30)  # 30 second timeout
     def _claude_api_call_with_timeout(self, prompt):
-        """Make Claude API call with timeout"""
-        return self.claude_client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        """Make Claude API call with timeout using ThreadPoolExecutor (cross-platform)."""
+        if not self.claude_client:
+            raise RuntimeError("Claude client not initialized")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            fut = executor.submit(
+                self.claude_client.messages.create,
+                model="claude-3-haiku-20240307",
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return fut.result(timeout=30)
     
     def _extract_basic_fields(self, text: str, doc_type: str) -> Dict[str, Any]:
         """Fallback basic field extraction using regex patterns"""
@@ -247,6 +241,15 @@ class GraphRelationshipBuilder:
         self.relationships = []
         self.entity_map = {}
         self.document_connections = {}
+        
+    def _normalize_name(self, value: Any) -> str:
+        """Normalize entity names for efficient equality matching."""
+        if value is None:
+            return ""
+        s = str(value)
+        s = ucnorm('NFKC', s.replace('\xa0', ' '))
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        return s
         
     def extract_entities_from_excel(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         """Extract entities from Excel data"""
@@ -367,36 +370,48 @@ class GraphRelationshipBuilder:
         return field_mapping.get(field_name, f"{doc_type}_{field_name}")
     
     def build_relationships(self, excel_entities: List[Dict], pdf_entities: List[Dict]) -> List[Dict[str, Any]]:
-        """Dynamic relationship building between entities"""
+        """Efficient relationship building using indexed joins to avoid cross-product scans."""
         relationships = []
         
-        # Create relationships between Excel and PDF entities
-        for excel_entity in excel_entities:
-            excel_name = excel_entity['name']
-            excel_type = excel_entity['type']
-            
-            for pdf_entity in pdf_entities:
-                pdf_name = pdf_entity['name']
-                pdf_type = pdf_entity['type']
-                
-                # Dynamic matching based on entity types
-                if self._should_create_relationship(excel_type, pdf_type, excel_name, pdf_name):
-                    relationship_type = self._get_relationship_type(excel_type, pdf_type)
-                    strength = self._calculate_relationship_strength(excel_name, pdf_name, excel_type, pdf_type)
-                    
-                    if strength > 0:
-                        relationships.append({
-                            'from': excel_entity['id'],
-                            'to': pdf_entity['id'],
-                            'type': relationship_type,
-                            'strength': strength,
-                            'description': f"Excel {excel_type} '{excel_name}' relates to PDF {pdf_type} '{pdf_name}'"
-                        })
+        # Build indexes: (type, normalized_name) -> [entities]
+        pdf_index: Dict[tuple, List[Dict]] = defaultdict(list)
+        for e in pdf_entities:
+            key = (e['type'], self._normalize_name(e['name']))
+            pdf_index[key].append(e)
         
-        # Create relationships within Excel data
+        # Similar/compatible types mapping
+        similar_types = {
+            'document_number': {'grn_code', 'invoice_number', 'po_number', 'quote_number', 'document_number'},
+            'supplier_name': {'vendor_name', 'company_name', 'supplier_name'},
+            'customer_name': {'buyer_name', 'customer_name'},
+            'amount': {'total_amount', 'amount'},
+            'date': {'grn_date', 'invoice_date', 'po_date', 'due_date', 'date'}
+        }
+        
+        def candidate_pdf_types(excel_type: str) -> List[str]:
+            if excel_type in similar_types:
+                return list(similar_types[excel_type])
+            # Also allow exact type matches by default
+            return [excel_type]
+        
+        # Join by normalized name across compatible types
+        for ex in excel_entities:
+            ex_name_norm = self._normalize_name(ex['name'])
+            if not ex_name_norm:
+                continue
+            for pdf_t in candidate_pdf_types(ex['type']):
+                for pdf_entity in pdf_index.get((pdf_t, ex_name_norm), []):
+                    relationship_type = self._get_relationship_type(ex['type'], pdf_entity['type'])
+                    relationships.append({
+                        'from': ex['id'],
+                        'to': pdf_entity['id'],
+                        'type': relationship_type,
+                        'strength': 1.0,
+                        'description': f"Excel {ex['type']} '{ex['name']}' relates to PDF {pdf_entity['type']} '{pdf_entity['name']}'"
+                    })
+        
+        # Create relationships within Excel/PDF data using star topology
         relationships.extend(self._build_within_source_relationships(excel_entities, 'excel', 'SAME_ROW'))
-        
-        # Create relationships within PDF data
         relationships.extend(self._build_within_source_relationships(pdf_entities, 'pdf', 'SAME_DOCUMENT'))
         
         return relationships
@@ -477,7 +492,7 @@ class GraphRelationshipBuilder:
         return 0.0
     
     def _build_within_source_relationships(self, entities: List[Dict], source: str, relationship_type: str) -> List[Dict]:
-        """Build relationships within the same data source"""
+        """Build relationships within the same data source using a star topology to avoid O(m^2)."""
         relationships = []
         
         if source == 'excel':
@@ -490,15 +505,20 @@ class GraphRelationshipBuilder:
                 row_groups[row_idx].append(entity)
             
             for row_idx, row_entities in row_groups.items():
-                for i, entity1 in enumerate(row_entities):
-                    for entity2 in row_entities[i+1:]:
-                        relationships.append({
-                            'from': entity1['id'],
-                            'to': entity2['id'],
-                            'type': relationship_type,
-                            'strength': 1.0,
-                            'description': f"Both entities from Excel row {row_idx}"
-                        })
+                if not row_entities:
+                    continue
+                # Prefer a hub with a document_number type if present
+                hub = next((e for e in row_entities if e.get('type') == 'document_number'), row_entities[0])
+                for e in row_entities:
+                    if e['id'] == hub['id']:
+                        continue
+                    relationships.append({
+                        'from': hub['id'],
+                        'to': e['id'],
+                        'type': relationship_type,
+                        'strength': 1.0,
+                        'description': f"Both entities from Excel row {row_idx}"
+                    })
         
         elif source == 'pdf':
             # Group by source file
@@ -510,15 +530,20 @@ class GraphRelationshipBuilder:
                 doc_groups[source_file].append(entity)
             
             for source_file, doc_entities in doc_groups.items():
-                for i, entity1 in enumerate(doc_entities):
-                    for entity2 in doc_entities[i+1:]:
-                        relationships.append({
-                            'from': entity1['id'],
-                            'to': entity2['id'],
-                            'type': relationship_type,
-                            'strength': 1.0,
-                            'description': f"Both entities from PDF document {source_file}"
-                        })
+                if not doc_entities:
+                    continue
+                # Prefer a hub with document_number if present
+                hub = next((e for e in doc_entities if e.get('type') == 'document_number'), doc_entities[0])
+                for e in doc_entities:
+                    if e['id'] == hub['id']:
+                        continue
+                    relationships.append({
+                        'from': hub['id'],
+                        'to': e['id'],
+                        'type': relationship_type,
+                        'strength': 1.0,
+                        'description': f"Both entities from PDF document {source_file}"
+                    })
         
         return relationships
     
@@ -572,7 +597,7 @@ class GraphRAGSystem:
         
     def load_excel_data(self, excel_path: str):
         """Load Excel data"""
-        print("📊 Loading Excel data...")
+        logger.info("📊 Loading Excel data...")
         self.df = pd.read_excel(excel_path)
         # Normalize key text fields to avoid unicode/whitespace mismatches
         def _norm_text(val: Any) -> Any:
@@ -589,12 +614,12 @@ class GraphRAGSystem:
         ]:
             if col in self.df.columns:
                 self.df[col] = self.df[col].apply(_norm_text)
-        print(f"✅ Loaded {len(self.df)} rows with {len(self.df.columns)} columns")
+        logger.info(f"✅ Loaded {len(self.df)} rows with {len(self.df.columns)} columns")
         return self.df
     
     def load_pdf_documents(self, pdf_folder: str) -> List[Dict[str, Any]]:
         """Load and process all PDF documents"""
-        print("📄 Loading PDF documents...")
+        logger.info("📄 Loading PDF documents...")
         
         all_chunks = []
         pdf_files = []
@@ -604,20 +629,20 @@ class GraphRAGSystem:
                 if file.endswith('.pdf'):
                     pdf_files.append(os.path.join(root, file))
         
-        print(f"📁 Found {len(pdf_files)} PDF files")
+        logger.info(f"📁 Found {len(pdf_files)} PDF files")
         
         for i, pdf_path in enumerate(pdf_files, 1):
             filename = os.path.basename(pdf_path)
-            print(f"  📄 Processing {filename} ({i}/{len(pdf_files)})...")
+            logger.info(f"  📄 Processing {filename} ({i}/{len(pdf_files)})...")
             
             try:
                 text = self.pdf_processor.extract_pdf_text(pdf_path)
                 if text:
                     doc_type = self.pdf_processor.detect_document_type(text, filename)
-                    print(f"    📋 Document type: {doc_type}")
-                    print(f"    🔍 Extracting structured data...")
+                    logger.info(f"    📋 Document type: {doc_type}")
+                    logger.info(f"    🔍 Extracting structured data...")
                     structured_data = self.pdf_processor.extract_structured_data(text, doc_type)
-                    print(f"    ✅ Processing completed")
+                    logger.info(f"    ✅ Processing completed")
                     # Populate field index for supplier -> address
                     try:
                         supplier_name = structured_data.get('supplier_name') if structured_data else None
@@ -632,8 +657,8 @@ class GraphRAGSystem:
                     
                     # Create overlapping sliding-window chunks over full text
                     full_text = text
-                    chunk_size = 1200  # characters
-                    overlap = 250      # characters
+                    chunk_size = Config.CHUNK_SIZE  # characters
+                    overlap = Config.OVERLAP      # characters
                     total_len = len(full_text)
                     j = 0
                     start = 0
@@ -657,13 +682,13 @@ class GraphRAGSystem:
                             break
                         start = end - overlap
                 else:
-                    print(f"    ⚠️  No text extracted from {filename}")
+                    logger.warning(f"    ⚠️  No text extracted from {filename}")
                     continue
                         
             except Exception as e:
-                print(f"⚠️ Error processing {pdf_path}: {e}")
+                logger.warning(f"⚠️ Error processing {pdf_path}: {e}")
         
-        print(f"✅ Created {len(all_chunks)} PDF chunks from {len(pdf_files)} documents")
+        logger.info(f"✅ Created {len(all_chunks)} PDF chunks from {len(pdf_files)} documents")
         return all_chunks
     
     def create_excel_chunks(self) -> List[Dict]:
@@ -698,52 +723,60 @@ class GraphRAGSystem:
     
     def build_system(self, excel_path: str, pdf_folder: str):
         """Build the complete system with relationships"""
-        print("🔧 Building Graph RAG System...")
+        logger.info("🔧 Building Graph RAG System...")
         
         # Load data
         self.load_excel_data(excel_path)
         pdf_chunks = self.load_pdf_documents(pdf_folder)
         
         # Extract entities
-        print("🔍 Extracting entities...")
+        logger.info("🔍 Extracting entities...")
         excel_entities = self.graph_builder.extract_entities_from_excel(self.df)
         pdf_entities = self.graph_builder.extract_entities_from_pdf(pdf_chunks)
         
-        print(f"✅ Extracted {len(excel_entities)} Excel entities")
-        print(f"✅ Extracted {len(pdf_entities)} PDF entities")
+        logger.info(f"✅ Extracted {len(excel_entities)} Excel entities")
+        logger.info(f"✅ Extracted {len(pdf_entities)} PDF entities")
         
         # Build relationships
-        print("🔗 Building relationships...")
+        logger.info("🔗 Building relationships...")
         relationships = self.graph_builder.build_relationships(excel_entities, pdf_entities)
         
-        print(f"✅ Created {len(relationships)} relationships")
+        logger.info(f"✅ Created {len(relationships)} relationships")
         
         # Create network graph
-        print("🕸️ Creating network graph...")
+        logger.info("🕸️ Creating network graph...")
         all_entities = excel_entities + pdf_entities
         self.graph = self.graph_builder.create_network_graph(all_entities, relationships)
         
         self.entities = all_entities
         self.relationships = relationships
         
-        print(f"✅ Network graph created with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
+        logger.info(f"✅ Network graph created with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
         
         # Build vector index for semantic search
-        print("🔢 Building vector index...")
+        logger.info("🔢 Building vector index...")
         excel_chunks = self.create_excel_chunks()
         all_chunks = excel_chunks + pdf_chunks
         
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         texts = [chunk['text'] for chunk in all_chunks]
-        embeddings = self.model.encode(texts).astype("float32")
+        # Batch encode and L2-normalize for cosine/IP search
+        embeddings = self.model.encode(texts, batch_size=128, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+        # Normalize to unit length
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
+        embeddings = embeddings / norms
         
         dim = embeddings.shape[1]
-        self.faiss_index = faiss.IndexFlatL2(dim)
+        # Use HNSW for large datasets, otherwise flat IP (cosine)
+        if len(embeddings) > 10000:
+            self.faiss_index = faiss.IndexHNSWFlat(dim, 32)
+        else:
+            self.faiss_index = faiss.IndexFlatIP(dim)
         self.faiss_index.add(embeddings)
         
         self.metadata_list = all_chunks
         
-        print(f"✅ Vector index built with {len(all_chunks)} chunks")
+        logger.info(f"✅ Vector index built with {len(all_chunks)} chunks")
         # Build BM25 structures over chunk texts
         self._build_bm25([c['text'] for c in all_chunks])
         
@@ -755,7 +788,10 @@ class GraphRAGSystem:
         if self.faiss_index is None:
             raise ValueError("System not built. Call build_system() first.")
         
-        q_emb = self.model.encode([query]).astype("float32")
+        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
+        # Normalize query to unit length for cosine/IP
+        q_norm = np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-12
+        q_emb = q_emb / q_norm
         search_k = max(k * 3, 30)
         D, I = self.faiss_index.search(q_emb, search_k)
         
@@ -770,7 +806,8 @@ class GraphRAGSystem:
         bm25_scores = self._bm25_search(query, candidate_indices=I[0].tolist())
         for i, idx in enumerate(I[0]):
             chunk = self.metadata_list[idx]
-            base_sim = 1 - float(D[0][i])
+            # With IP/cosine, D holds similarity directly
+            base_sim = float(D[0][i])
             text_lower = chunk['text'].lower()
             boost = 0.0
             if any(tok in text_lower for tok in q_tokens):
@@ -788,7 +825,7 @@ class GraphRAGSystem:
                 'document_type': chunk.get('document_type', 'unknown'),
                 'row_index': chunk.get('row_index'),
                 'similarity': adjusted,
-                'distance': float(D[0][i])
+                'distance': 1.0 - base_sim
             })
         results.sort(key=lambda r: r['similarity'], reverse=True)
         return results[:k]
@@ -796,7 +833,7 @@ class GraphRAGSystem:
     def _tokenize(self, text: str) -> List[str]:
         return [t for t in re.findall(r"[A-Za-z0-9]+", text.lower()) if len(t) > 2]
 
-    def _build_bm25(self, docs: List[str], k1: float = 1.5, b: float = 0.75):
+    def _build_bm25(self, docs: List[str], k1: float = Config.BM25_K1, b: float = Config.BM25_B):
         # Tokenize documents
         tokenized = [self._tokenize(t) for t in docs]
         self._bm25_docs = tokenized
@@ -817,7 +854,7 @@ class GraphRAGSystem:
         self._bm25_doc_len = doc_len
 
     def _bm25_search(self, query: str, top_n: int = 100, candidate_indices: Optional[List[int]] = None,
-                      k1: float = 1.5, b: float = 0.75) -> Dict[int, float]:
+                      k1: float = Config.BM25_K1, b: float = Config.BM25_B) -> Dict[int, float]:
         if not self._bm25_docs:
             return {}
         q_tokens = self._tokenize(query)
@@ -1105,7 +1142,7 @@ Answer:"""
         with open(output_file, 'w') as f:
             json.dump(graph_data, f, indent=2)
         
-        print(f"✅ Graph data exported to {output_file}")
+        logger.info(f"✅ Graph data exported to {output_file}")
         return graph_data
     
     def export_to_neo4j(self, neo4j_uri: str = "bolt://localhost:7687", 
@@ -1123,7 +1160,7 @@ Answer:"""
                 if clear_database:
                     # Clear existing data
                     session.run("MATCH (n) DETACH DELETE n")
-                    print("🗑️ Cleared existing Neo4j data")
+                    logger.info("🗑️ Cleared existing Neo4j data")
                 
                 # Create nodes
                 node_count = 0
@@ -1182,15 +1219,15 @@ Answer:"""
                     'neo4j_uri': neo4j_uri
                 }
                 
-                print(f"✅ Exported {node_count} nodes and {rel_count} relationships to Neo4j")
-                print(f"🌐 Neo4j Browser: http://localhost:7474")
-                print(f"🔗 Connection: {neo4j_uri}")
+                logger.info(f"✅ Exported {node_count} nodes and {rel_count} relationships to Neo4j")
+                logger.info(f"🌐 Neo4j Browser: http://localhost:7474")
+                logger.info(f"🔗 Connection: {neo4j_uri}")
                 
                 return result
                 
         except Exception as e:
             error_msg = f"Error exporting to Neo4j: {str(e)}"
-            print(f"❌ {error_msg}")
+            logger.error(f"❌ {error_msg}")
             return {'success': False, 'error': error_msg}
     
     def generate_neo4j_cypher_queries(self) -> List[str]:
@@ -1232,9 +1269,9 @@ Answer:"""
 
 def main():
     """Demo the Graph RAG System"""
-    print("🚀 Graph RAG System Demo")
-    print("📊 Excel + PDF Integration with Relationships")
-    print("=" * 60)
+    logger.info("🚀 Graph RAG System Demo")
+    logger.info("📊 Excel + PDF Integration with Relationships")
+    logger.info("=" * 60)
     
     # Initialize system
     claude_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -1245,26 +1282,26 @@ def main():
     pdf_folder = "data/pdfs"
     
     if not os.path.exists(excel_path) or not os.path.exists(pdf_folder):
-        print("❌ Required data files not found")
+        logger.error("❌ Required data files not found")
         return
     
     entities, relationships = rag.build_system(excel_path, pdf_folder)
     
     # Show statistics
     stats = rag.get_system_statistics()
-    print(f"\n📊 System Statistics:")
-    print(f"  • Total nodes: {stats['total_nodes']}")
-    print(f"  • Total edges: {stats['total_edges']}")
-    print(f"  • Graph density: {stats['density']:.3f}")
-    print(f"  • Connected components: {stats['connected_components']}")
+    logger.info(f"\n📊 System Statistics:")
+    logger.info(f"  • Total nodes: {stats['total_nodes']}")
+    logger.info(f"  • Total edges: {stats['total_edges']}")
+    logger.info(f"  • Graph density: {stats['density']:.3f}")
+    logger.info(f"  • Connected components: {stats['connected_components']}")
     
-    print(f"\n📋 Node Types:")
+    logger.info(f"\n📋 Node Types:")
     for node_type, count in stats['node_types'].items():
-        print(f"  • {node_type}: {count}")
+        logger.info(f"  • {node_type}: {count}")
     
-    print(f"\n🔗 Relationship Types:")
+    logger.info(f"\n🔗 Relationship Types:")
     for edge_type, count in stats['edge_types'].items():
-        print(f"  • {edge_type}: {count}")
+        logger.info(f"  • {edge_type}: {count}")
     
     # Test queries
     test_queries = [
@@ -1275,54 +1312,54 @@ def main():
     ]
     
     for query in test_queries:
-        print(f"\n{'='*60}")
-        print(f"❓ Query: {query}")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"❓ Query: {query}")
+        logger.info('='*60)
         
         result = rag.search_and_answer(query)
-        print(f"📊 Found {result['num_results']} search results")
-        print(f"🔗 Found {result['num_relationships']} related documents")
+        logger.info(f"📊 Found {result['num_results']} search results")
+        logger.info(f"🔗 Found {result['num_relationships']} related documents")
         
         if result['answer']:
-            print(f"\n🤖 Answer: {result['answer']}")
+            logger.info(f"\n🤖 Answer: {result['answer']}")
         else:
-            print(f"\n📋 Search Results:")
+            logger.info(f"\n📋 Search Results:")
             for i, search_result in enumerate(result['search_results'][:3]):
-                print(f"  {i+1}. {search_result['type']} - {search_result['source']} (similarity: {search_result['similarity']:.3f})")
-                print(f"     {search_result['text'][:100]}...")
+                logger.info(f"  {i+1}. {search_result['type']} - {search_result['source']} (similarity: {search_result['similarity']:.3f})")
+                logger.info(f"     {search_result['text'][:100]}...")
     
     # Export graph data
-    print(f"\n📁 Exporting graph data...")
+    logger.info(f"\n📁 Exporting graph data...")
     rag.export_graph_data()
     
-    print(f"\n🎉 Graph RAG System Demo completed!")
-    print(f"📊 System has {stats['total_nodes']} nodes and {stats['total_edges']} relationships")
+    logger.info(f"\n🎉 Graph RAG System Demo completed!")
+    logger.info(f"📊 System has {stats['total_nodes']} nodes and {stats['total_edges']} relationships")
 
 if __name__ == "__main__":
     # Check for API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        print("⚠️  No Anthropic API key found!")
-        print("🔑 To enable AI-powered features:")
-        print("   1. Get your API key from: https://console.anthropic.com/")
-        print("   2. Set it as environment variable: export ANTHROPIC_API_KEY='your_key'")
-        print("\n🤖 Running with basic functionality (no AI features)...")
+        logger.warning("⚠️  No Anthropic API key found!")
+        logger.info("🔑 To enable AI-powered features:")
+        logger.info("   1. Get your API key from: https://console.anthropic.com/")
+        logger.info("   2. Set it as environment variable: export ANTHROPIC_API_KEY='your_key'")
+        logger.info("\n🤖 Running with basic functionality (no AI features)...")
     
     rag = GraphRAGSystem(api_key)
     rag.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
 
     stats = rag.get_system_statistics()
-    print("\n📈 SYSTEM STATISTICS 📈")
-    print(json.dumps(stats, indent=2))
+    logger.info("\n📈 SYSTEM STATISTICS 📈")
+    logger.info(json.dumps(stats, indent=2))
 
     query = "Find invoices linked with supplier XYZ Books"
     result = rag.search_and_answer(query)
 
-    print("\n🧠 AI ANSWER 🧠")
-    print(result["answer"])
+    logger.info("\n🧠 AI ANSWER 🧠")
+    logger.info(result["answer"])
 
-    print("\n🔗 RELATED DOCUMENTS 🔗")
+    logger.info("\n🔗 RELATED DOCUMENTS 🔗")
     for rel in result["related_documents"]:
-        print(f"- {rel['entity_name']} ↔ {rel['related_entity']} ({rel['relationship_type']}) [{rel['relationship_strength']}]")
+        logger.info(f"- {rel['entity_name']} ↔ {rel['related_entity']} ({rel['relationship_type']}) [{rel['relationship_strength']}]")
 
     
