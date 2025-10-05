@@ -1,37 +1,60 @@
-## 🧠 Graph RAG System - Excel + PDF Intelligence with Neo4j
+## 🧠 Graph RAG System - Advanced Document Intelligence Platform
 
-This project turns your Excel inventory and PDF documents (POs, GRNs, invoices, etc.) into a searchable knowledge system. It builds a vector index for semantic retrieval and a relationship graph for explainability, then uses an LLM to answer natural-language questions with citations.
+A comprehensive Retrieval-Augmented Generation (RAG) system that transforms Excel inventory data and PDF documents into an intelligent, searchable knowledge graph. The system combines semantic vector search, lexical BM25 retrieval, AI-powered document understanding, and relationship mapping to provide accurate, contextual answers with full traceability.
 
-Use this README as an implementation guide. It explains exactly how data is ingested, how retrieval works, how relationships are formed, and how answers are produced end-to-end.
+### ✨ Key Features
 
-### 💻 Quick start
+- **🤖 AI-Powered Document Understanding**: Automatic document type detection and structured field extraction using Claude AI
+- **🔍 Hybrid Search**: Combines semantic vector search (FAISS) with lexical BM25 for optimal retrieval
+- **🕸️ Knowledge Graph**: Builds explicit relationships between Excel data and PDF documents using NetworkX
+- **🌐 Neo4j Integration**: Export and visualize relationships in Neo4j graph database
+- **💻 Modern Web Interface**: Beautiful, responsive Flask web application with real-time statistics
+- **🔄 Dynamic Updates**: Hot-reload system for adding new documents without restart
+- **📊 Advanced Analytics**: Comprehensive system statistics and relationship analysis
 
+### 💻 Quick Start
+
+#### Prerequisites
+- Python 3.8+
+- Anthropic API key (for AI features)
+
+#### Installation
+
+1. **Clone and setup environment**:
 ```bash
-1) Create environment and install deps (if not already)
-cd /Users/khushiagrawal/Desktop/graph_rag
-source venv/bin/activate
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
-2) Ensure ANTHROPIC_API_KEY is set
-export ANTHROPIC_API_KEY="<your_key>"
-
-3) Start the web interface
-python start_web_interface.py
-
-4) Open the app
-#    http://localhost:5001
 ```
 
-### ✨ Adding or updating data
-Place new PDFs anywhere under `data/pdfs/` (subfolders are fine). The system scans recursively.
-
-After adding PDFs, call the reload endpoint to rebuild indices without restarting:
+2. **Configure API key**:
 ```bash
-curl -X POST http://localhost:5001/api/reload
+export ANTHROPIC_API_KEY="your_anthropic_api_key_here"
+# Or create a .env file with: ANTHROPIC_API_KEY=your_key_here
 ```
-This triggers a fresh end-to-end build: Excel load → PDF processing → graph build → embeddings + indices.
 
-Tip: You can also just restart the app, but `/api/reload` is faster for iterative uploads.
+3. **Start the web interface**:
+```bash
+python start_web_interface.py
+# Or directly: python app.py
+```
+
+4. **Access the application**:
+   - Open your browser to: http://localhost:5001
+   - The system will automatically build indices from your data
+
+### 📁 Data Management
+
+#### Adding Documents
+- **Excel files**: Place in `data/excel/` directory
+- **PDF documents**: Place anywhere under `data/pdfs/` (supports subdirectories)
+- Supported PDF types: GRNs, Invoices, Purchase Orders, Proforma Invoices, Quotations, etc.
+
+#### Updating the System
+After adding new documents, trigger a system rebuild:
+
+
+
 
 ## ⁉️ How it works (precise, step-by-step)
 
@@ -54,27 +77,43 @@ Where to look in code:
 - `PDFProcessor.detect_document_type(...)`
 - `PDFProcessor.extract_structured_data(...)` and `_extract_basic_fields(...)`
 
-### 3) Chunking and embeddings (vector index) + BM25
-- PDF text is split into overlapping character windows (e.g., 1200 chars with 250-char overlap). Each window becomes a “PDF chunk” with metadata: source filename, document type, and the structured field JSON (if available).
-- Excel rows are represented as single chunks (one per row) with a concise header + row data.
-- All chunks (Excel + PDF) are embedded using `sentence-transformers` (`all-MiniLM-L6-v2`). The embeddings are indexed in FAISS (`IndexFlatL2`).
-- In parallel, a simple BM25 structure is built over the raw chunk texts for lexical matching.
+### 3) Advanced Chunking & Hybrid Indexing
+- **PDF Processing**: Text split into overlapping windows (1200 chars, 250-char overlap) with metadata including document type and AI-extracted structured fields
+- **Excel Processing**: Each row becomes a single chunk with normalized header information and raw data
+- **Vector Index**: All chunks embedded using `sentence-transformers` (`all-MiniLM-L6-v2`) and indexed in FAISS with cosine similarity
+- **BM25 Index**: Parallel lexical search index for exact token matching and keyword retrieval
+- **Hybrid Fusion**: Combines vector similarity + BM25 scores + token boosts for optimal retrieval
 
-Why two indices? Vector search is great for semantics (e.g., “GST for this PO”), while BM25 helps with exact tokens (e.g., `PO-CP-202509-011`). We fuse them to balance recall and precision.
+**Why Hybrid?** 
+- Vector search excels at semantic understanding (e.g., "GST amount for purchase orders")
+- BM25 handles exact matches and specific identifiers (e.g., `PO-CP-202509-011`)
+- Fusion algorithm: `final_score = vector_similarity + token_boost + 0.4 × BM25_score`
 
 Where to look in code:
 - Vector index build: `GraphRAGSystem.build_system(...)`
 - BM25: `_build_bm25(...)`
 
-### 4) Hybrid retrieval pipeline
-Given your question, the system:
-1. Embeds the query and searches FAISS for a wide candidate set.
-2. Computes BM25 scores over the same candidates.
-3. Combines scores: base vector similarity + small token boost + 0.4 × BM25 score.
-4. Applies light intent handling (e.g., address queries may widen `k` and use a supplier→address cache built from extracted fields).
-5. Returns the top-k ranked chunks (Excel rows and PDF text windows).
+### 4) Intelligent Retrieval Pipeline
+The system processes queries through a sophisticated multi-stage pipeline:
 
-This is why PO-specific questions work: the PO id token improves BM25; semantic phrasing is handled by embeddings; together they surface the correct PDF window(s).
+1. **Query Analysis**: Detects query intent (aggregation, address lookup, specific document search)
+2. **Candidate Retrieval**: 
+   - Embeds query using same transformer model
+   - Searches FAISS vector index for semantic matches
+   - Retrieves wide candidate set (3x final k)
+3. **BM25 Scoring**: Computes lexical relevance scores for all candidates
+4. **Score Fusion**: `final_score = vector_similarity + token_boost + 0.4 × BM25_score`
+5. **Intent-Specific Processing**:
+   - **Address queries**: Uses supplier→address cache for direct lookup
+   - **Aggregation queries**: Expands search to include all relevant data
+   - **Document-specific**: Enhances token matching for exact references
+6. **Result Ranking**: Returns top-k chunks with similarity scores
+
+**Advanced Features**:
+- Unicode normalization for consistent matching
+- Supplier address caching for fast lookups
+- Dynamic k adjustment based on query complexity
+- Fallback mechanisms for API timeouts
 
 Where to look in code:
 - `GraphRAGSystem.search(...)` (fusion logic and ranking)
@@ -138,20 +177,5 @@ What gets exported:
    - <img width="1470" height="688" alt="Screenshot 2025-10-05 at 3 59 50 PM" src="https://github.com/user-attachments/assets/32999bbb-dd39-48b4-97c8-213e47dfd098" />
 
 
-## File map
-- `graph_rag_system.py`: Core pipeline (ingestion, PDF understanding, chunking, embeddings, BM25, hybrid retrieval, LLM answering, graph build, Neo4j export)
-- `app.py`: Flask API (`/api/query`, `/api/stats`, `/api/health`, and `/api/reload` to rebuild indices)
-- `templates/index.html`: Web UI (query input, live stats, results, relationships)
-- `start_web_interface.py`: Helper launcher for the web app
-- `demo_script.py`: Programmatic demo of building and querying
-- `requirements.txt`: Dependencies
-- `data/excel/`: Excel inventory source(s)
-- `data/pdfs/`: Your PDFs (POs, GRNs, invoices, etc.)
 
-## Troubleshooting
-- “New PDFs aren’t reflected in answers”: Call `POST /api/reload` to rebuild indices after adding files.
-- “No Anthropic key”: Set `ANTHROPIC_API_KEY`. Without it, you’ll still get search/relationships, but not full LLM-written answers.
-- “Vector/BM25 mismatch”: Ensure filenames contain helpful tokens (e.g., PO IDs) and PDF text is extractable (selectable text, not just images). If PDFs are scans, add OCR before indexing.
-
-That’s it. With this pipeline, even PO-specific questions like “What is the GST amount for PO-XXXX?” work reliably because the system combines token-sensitive BM25, semantic embeddings, structured field extraction, and a relationship graph for context and explainability.
 
