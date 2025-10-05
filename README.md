@@ -119,9 +119,8 @@ What gets exported:
 - Nodes labeled by source (Excel/Pdf) and type (e.g., `Supplier_name`, `Document_number`, etc.).
 - Edges with relationship type (e.g., `SAME_DOCUMENT_REFERENCE`) and a `strength` score.
 
-## Screenshots (placeholders)
+## Screenshots 
 
-Replace the placeholders below with your actual screenshots to showcase the full flow:
 
 1) Home screen and a sample question
    - <img width="1470" height="834" alt="Screenshot 2025-10-05 at 3 58 28 PM" src="https://github.com/user-attachments/assets/c9bb72e6-7845-401c-81bc-5bf88db5eade" />
