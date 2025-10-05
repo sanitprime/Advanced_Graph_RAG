@@ -1,28 +1,28 @@
-## Graph RAG System — Excel + PDF Intelligence with Neo4j
+## 🧠 Graph RAG System - Excel + PDF Intelligence with Neo4j
 
 This project turns your Excel inventory and PDF documents (POs, GRNs, invoices, etc.) into a searchable knowledge system. It builds a vector index for semantic retrieval and a relationship graph for explainability, then uses an LLM to answer natural-language questions with citations.
 
 Use this README as an implementation guide. It explains exactly how data is ingested, how retrieval works, how relationships are formed, and how answers are produced end-to-end.
 
-### Quick start
+### 💻 Quick start
 
 ```bash
-# 1) Create environment and install deps (if not already)
+1) Create environment and install deps (if not already)
 cd /Users/khushiagrawal/Desktop/graph_rag
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 2) Ensure ANTHROPIC_API_KEY is set
+2) Ensure ANTHROPIC_API_KEY is set
 export ANTHROPIC_API_KEY="<your_key>"
 
-# 3) Start the web interface
+3) Start the web interface
 python start_web_interface.py
 
-# 4) Open the app
+4) Open the app
 #    http://localhost:5001
 ```
 
-### Adding or updating data
+### ✨ Adding or updating data
 Place new PDFs anywhere under `data/pdfs/` (subfolders are fine). The system scans recursively.
 
 After adding PDFs, call the reload endpoint to rebuild indices without restarting:
@@ -33,7 +33,7 @@ This triggers a fresh end-to-end build: Excel load → PDF processing → graph 
 
 Tip: You can also just restart the app, but `/api/reload` is faster for iterative uploads.
 
-## How it works (precise, step-by-step)
+## ⁉️ How it works (precise, step-by-step)
 
 ### 1) Data ingestion
 - Excel: `ABC_Book_Stores_Inventory_Register.xlsx` is read and key text fields are normalized (Unicode normalization, whitespace cleanup). Each row becomes an “Excel chunk” with a compact header (supplier, customer, book, totals, PO, GRN) plus the raw row dict.
@@ -124,16 +124,20 @@ What gets exported:
 Replace the placeholders below with your actual screenshots to showcase the full flow:
 
 1) Home screen and a sample question
-   - [PLACEHOLDER IMAGE HERE]
+   - <img width="1470" height="834" alt="Screenshot 2025-10-05 at 3 58 28 PM" src="https://github.com/user-attachments/assets/c9bb72e6-7845-401c-81bc-5bf88db5eade" />
 
-2) Correct answer for a PO GST question (e.g., `PO-CP-202509-011`)
-   - [PLACEHOLDER IMAGE HERE]
+
+2) Correct answer for a PO GST question 
+   - <img width="1470" height="833" alt="Screenshot 2025-10-05 at 3 59 01 PM" src="https://github.com/user-attachments/assets/b530be83-a056-45c7-aae8-6f3602f3cc6c" />
+
 
 3) Search results and “Related documents” panel
-   - [PLACEHOLDER IMAGE HERE]
+   - <img width="1470" height="832" alt="Screenshot 2025-10-05 at 3 59 12 PM" src="https://github.com/user-attachments/assets/89f6cacd-7d6e-4302-aa7c-415b7af2a8a1" />
+
 
 4) Neo4j graph view with nodes/edges
-   - [PLACEHOLDER IMAGE HERE]
+   - <img width="1470" height="688" alt="Screenshot 2025-10-05 at 3 59 50 PM" src="https://github.com/user-attachments/assets/32999bbb-dd39-48b4-97c8-213e47dfd098" />
+
 
 ## File map
 - `graph_rag_system.py`: Core pipeline (ingestion, PDF understanding, chunking, embeddings, BM25, hybrid retrieval, LLM answering, graph build, Neo4j export)
