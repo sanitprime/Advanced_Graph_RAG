@@ -11,3 +11,4 @@ pymupdf>=1.26.4
 networkx>=3.0
 matplotlib>=3.5.0
 neo4j>=5.15.0
+dotenv>=1.0.0
