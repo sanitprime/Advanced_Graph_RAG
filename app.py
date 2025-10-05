@@ -30,6 +30,23 @@ def initialize_system():
         rag_system.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
         print("✅ System initialized successfully!")
 
+@app.route('/api/reload', methods=['POST'])
+def reload_system():
+    """Rebuild the Graph RAG system (use when new PDFs are added)"""
+    try:
+        global rag_system
+        print("🔄 Reloading Graph RAG System...")
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+        # Recreate the system to ensure a clean rebuild
+        rag_system = GraphRAGSystem(api_key)
+        rag_system.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
+        print("✅ Reload completed!")
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # Initialize system on startup
 print("🚀 Starting Graph RAG Web Interface...")
 initialize_system()

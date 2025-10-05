@@ -21,6 +21,7 @@ from collections import defaultdict
 from neo4j import GraphDatabase
 import signal
 from functools import wraps
+from unicodedata import normalize as ucnorm
 
 def timeout_handler(signum, frame):
     raise TimeoutError("Operation timed out")
@@ -559,11 +560,35 @@ class GraphRAGSystem:
         self.graph = None
         self.entities = []
         self.relationships = []
+        # Field index and BM25 data structures
+        self.field_index = {
+            'supplier_to_addresses': defaultdict(set)
+        }
+        self._bm25_docs = []           # list[list[str]] tokenized docs
+        self._bm25_df = {}             # term -> doc frequency
+        self._bm25_idf = {}            # term -> idf
+        self._bm25_doc_len = []        # list[int]
+        self._bm25_avgdl = 0.0
         
     def load_excel_data(self, excel_path: str):
         """Load Excel data"""
         print("📊 Loading Excel data...")
         self.df = pd.read_excel(excel_path)
+        # Normalize key text fields to avoid unicode/whitespace mismatches
+        def _norm_text(val: Any) -> Any:
+            if pd.isna(val):
+                return val
+            s = str(val)
+            s = ucnorm('NFKC', s.replace('\xa0', ' '))  # replace NBSP, normalize unicode
+            s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace
+            return s
+
+        for col in [
+            'Supplier Name', 'Customer Name', 'Book Title', 'Author', 'Publisher',
+            'GRN Code', 'Purchase Order No.', 'Sales Inv No.'
+        ]:
+            if col in self.df.columns:
+                self.df[col] = self.df[col].apply(_norm_text)
         print(f"✅ Loaded {len(self.df)} rows with {len(self.df.columns)} columns")
         return self.df
     
@@ -593,25 +618,44 @@ class GraphRAGSystem:
                     print(f"    🔍 Extracting structured data...")
                     structured_data = self.pdf_processor.extract_structured_data(text, doc_type)
                     print(f"    ✅ Processing completed")
+                    # Populate field index for supplier -> address
+                    try:
+                        supplier_name = structured_data.get('supplier_name') if structured_data else None
+                        address_val = structured_data.get('address') if structured_data else None
+                        if supplier_name and address_val:
+                            sup_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(supplier_name).replace('\xa0',' '))).strip().lower()
+                            addr_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(address_val).replace('\xa0',' '))).strip()
+                            if sup_norm and addr_norm:
+                                self.field_index['supplier_to_addresses'][sup_norm].add(addr_norm)
+                    except Exception:
+                        pass
                     
-                    # Create chunks
-                    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-                    
-                    for j, paragraph in enumerate(paragraphs):
-                        if len(paragraph) < 50:
-                            continue
-                        
-                        chunk = {
-                            'id': f"{filename}_{j}",
-                            'source': filename,
-                            'type': 'pdf',
-                            'document_type': doc_type,
-                            'text': paragraph,
-                            'structured_data': structured_data,
-                            'chunk_index': j,
-                            'total_chunks': len(paragraphs)
-                        }
-                        all_chunks.append(chunk)
+                    # Create overlapping sliding-window chunks over full text
+                    full_text = text
+                    chunk_size = 1200  # characters
+                    overlap = 250      # characters
+                    total_len = len(full_text)
+                    j = 0
+                    start = 0
+                    while start < total_len:
+                        end = min(start + chunk_size, total_len)
+                        chunk_text = full_text[start:end].strip()
+                        if chunk_text:
+                            chunk = {
+                                'id': f"{filename}_{j}",
+                                'source': filename,
+                                'type': 'pdf',
+                                'document_type': doc_type,
+                                'text': chunk_text,
+                                'structured_data': structured_data,
+                                'chunk_index': j,
+                                'total_chunks': None
+                            }
+                            all_chunks.append(chunk)
+                            j += 1
+                        if end == total_len:
+                            break
+                        start = end - overlap
                 else:
                     print(f"    ⚠️  No text extracted from {filename}")
                     continue
@@ -629,13 +673,23 @@ class GraphRAGSystem:
         
         chunks = []
         for idx, row in self.df.iterrows():
+            supplier = row.get('Supplier Name', '')
+            customer = row.get('Customer Name', '')
+            title = row.get('Book Title', '')
+            total_purchase = row.get('Total Purchase amount', '')
+            po = row.get('Purchase Order No.', '')
+            grn = row.get('GRN Code', '')
+            header = (
+                f"Supplier: {supplier} | Customer: {customer} | Book: {title} | "
+                f"Total Purchase amount: {total_purchase} | PO: {po} | GRN: {grn}"
+            )
             chunk = {
                 'id': f"excel_row_{idx}",
                 'source': 'ABC_Book_Stores_Inventory_Register.xlsx',
                 'type': 'excel',
                 'document_type': 'inventory_register',
                 'row_index': idx,
-                'text': str(row.to_dict()),
+                'text': header + "\n" + str(row.to_dict()),
                 'raw_data': row.to_dict()
             }
             chunks.append(chunk)
@@ -690,37 +744,114 @@ class GraphRAGSystem:
         self.metadata_list = all_chunks
         
         print(f"✅ Vector index built with {len(all_chunks)} chunks")
+        # Build BM25 structures over chunk texts
+        self._build_bm25([c['text'] for c in all_chunks])
         
         return all_entities, relationships
     
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Semantic search across all data"""
+    def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        """Hybrid retrieval: vector search fused with BM25 over chunk text.
+        Optionally restrict candidates based on supplier names in query."""
         if self.faiss_index is None:
             raise ValueError("System not built. Call build_system() first.")
         
         q_emb = self.model.encode([query]).astype("float32")
-        D, I = self.faiss_index.search(q_emb, k)
+        search_k = max(k * 3, 30)
+        D, I = self.faiss_index.search(q_emb, search_k)
         
         results = []
+        q_tokens = [t for t in re.findall(r"[A-Za-z0-9_]+", query.lower()) if len(t) > 2]
+        # Supplier filter if query mentions a supplier entity
+        supplier_match = None
+        m = re.search(r"address\s+of\s+(.+)$", query, re.IGNORECASE)
+        if m:
+            supplier_match = m.group(1).strip().lower()
+        # BM25 scores for same candidate pool
+        bm25_scores = self._bm25_search(query, candidate_indices=I[0].tolist())
         for i, idx in enumerate(I[0]):
             chunk = self.metadata_list[idx]
+            base_sim = 1 - float(D[0][i])
+            text_lower = chunk['text'].lower()
+            boost = 0.0
+            if any(tok in text_lower for tok in q_tokens):
+                boost += 0.1
+            # Fuse with BM25 score (scaled)
+            bm25 = bm25_scores.get(int(idx), 0.0)
+            adjusted = base_sim + boost + 0.4 * bm25
+            # Optional supplier filter: keep chunks containing the supplier string
+            if supplier_match and supplier_match not in text_lower:
+                continue
             results.append({
                 'text': chunk['text'],
                 'source': chunk['source'],
                 'type': chunk['type'],
                 'document_type': chunk.get('document_type', 'unknown'),
-                'similarity': 1 - D[0][i],
-                'distance': D[0][i]
+                'row_index': chunk.get('row_index'),
+                'similarity': adjusted,
+                'distance': float(D[0][i])
             })
-        
-        return results
+        results.sort(key=lambda r: r['similarity'], reverse=True)
+        return results[:k]
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [t for t in re.findall(r"[A-Za-z0-9]+", text.lower()) if len(t) > 2]
+
+    def _build_bm25(self, docs: List[str], k1: float = 1.5, b: float = 0.75):
+        # Tokenize documents
+        tokenized = [self._tokenize(t) for t in docs]
+        self._bm25_docs = tokenized
+        N = len(tokenized)
+        df = {}
+        doc_len = []
+        for tokens in tokenized:
+            doc_len.append(len(tokens))
+            for term in set(tokens):
+                df[term] = df.get(term, 0) + 1
+        self._bm25_df = df
+        self._bm25_avgdl = float(sum(doc_len)) / N if N else 0.0
+        # idf (BM25 variant)
+        idf = {}
+        for term, dfi in df.items():
+            idf[term] = max(0.0, np.log((N - dfi + 0.5) / (dfi + 0.5) + 1))
+        self._bm25_idf = idf
+        self._bm25_doc_len = doc_len
+
+    def _bm25_search(self, query: str, top_n: int = 100, candidate_indices: Optional[List[int]] = None,
+                      k1: float = 1.5, b: float = 0.75) -> Dict[int, float]:
+        if not self._bm25_docs:
+            return {}
+        q_tokens = self._tokenize(query)
+        if not q_tokens:
+            return {}
+        # term frequencies per doc for candidate set only
+        candidates = candidate_indices if candidate_indices is not None else list(range(len(self._bm25_docs)))
+        scores = {}
+        for di in candidates:
+            tokens = self._bm25_docs[di]
+            if not tokens:
+                continue
+            tf = {}
+            for t in tokens:
+                tf[t] = tf.get(t, 0) + 1
+            score = 0.0
+            dl = self._bm25_doc_len[di] or 1
+            for qt in q_tokens:
+                if qt not in tf:
+                    continue
+                idf = self._bm25_idf.get(qt, 0.0)
+                freq = tf[qt]
+                denom = freq + k1 * (1 - b + b * (dl / (self._bm25_avgdl or 1)))
+                score += idf * ((freq * (k1 + 1)) / denom)
+            # scale score down to be compatible with cosine similarities
+            scores[di] = score / 10.0
+        return scores
     
     def find_related_documents(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
         """Find documents related through graph relationships"""
         if not self.graph:
             return []
         
-        search_results = self.search(query, k=5)
+        search_results = self.search(query, k=10)
         related_docs = []
         processed_nodes = set()
         
@@ -806,9 +937,88 @@ Answer:"""
     def search_and_answer(self, query: str, k: int = 5) -> Dict[str, Any]:
         """Complete search and answer pipeline"""
         print(f"🔍 Searching for: '{query}'")
-        
+
+        # Increase k substantially for aggregation-style queries (e.g., totals across suppliers/customers)
+        agg_patterns = [
+            r"\btotal\b",
+            r"\bsum\b",
+            r"\baggregate\b",
+            r"\bacross\s+all\b"
+        ]
+        is_agg = any(re.search(p, query, re.IGNORECASE) for p in agg_patterns) and \
+                 any(re.search(p, query, re.IGNORECASE) for p in [r"supplier", r"customer", r"suppliers", r"customers"]) 
+
+        # If aggregation intent detected, raise k to all Excel rows (plus buffer)
+        k_effective = max(k, 10)
+        if is_agg and isinstance(self.df, pd.DataFrame):
+            excel_rows = len(self.df)
+            # Ensure we retrieve at least all excel chunks; add small buffer for PDFs
+            k_effective = max(k_effective, excel_rows + 20)
+
+        # Address-style queries: try to extract address from retrieved chunks (no special boosts)
+        addr_intent = re.search(r"\baddress\b|\blocation\b", query, re.IGNORECASE)
+        supplier_target = None
+        m = re.search(r"address\s+of\s+(.+)$", query, re.IGNORECASE)
+        if m:
+            supplier_target = m.group(1).strip()
+
         # Semantic search
-        search_results = self.search(query, k)
+        # If address intent, retrieve all chunks to maximize recall
+        if addr_intent:
+            k_effective = len(self.metadata_list) if isinstance(self.metadata_list, list) else max(k_effective, 100)
+        search_results = self.search(query, k_effective)
+
+        # If address intent, first try exact match from field index
+        if addr_intent and supplier_target:
+            sup_norm = re.sub(r"\s+", " ", ucnorm('NFKC', supplier_target.replace('\xa0',' '))).strip().lower()
+            addr_set = self.field_index['supplier_to_addresses'].get(sup_norm)
+            if addr_set:
+                candidate = sorted(addr_set, key=len, reverse=True)[0]
+                answer = f"Address: {candidate}"
+                related_docs = self.find_related_documents(query, max_results=10)
+                return {
+                    'query': query,
+                    'answer': answer,
+                    'search_results': self.search(query, k_effective),
+                    'related_documents': related_docs,
+                    'num_results': len(self.metadata_list) if isinstance(self.metadata_list, list) else 0,
+                    'num_relationships': len(related_docs)
+                }
+
+        # If address intent, scan retrieved chunks for address-like text
+        if addr_intent:
+            addr_regexes = [
+                r"\b\d{1,4}[^\n,]{0,40},[^\n]{0,80}\b\d{6}\b",  # typical Indian address with 6-digit PIN
+                r"\b[A-Z0-9\-]{1,10}[^\n,]{0,40},[^\n]{0,120}\b"    # fallback general pattern
+            ]
+            candidate = None
+            best_len = 0
+            q_sup = (supplier_target or '').lower()
+            for res in search_results:
+                if res.get('type') != 'pdf':
+                    continue
+                text = res.get('text', '')
+                low = text.lower()
+                if q_sup and q_sup not in low:
+                    continue
+                for rgx in addr_regexes:
+                    for m2 in re.finditer(rgx, text, flags=re.IGNORECASE):
+                        addr = m2.group(0).strip()
+                        # prefer longer plausible addresses
+                        if len(addr) > best_len:
+                            best_len = len(addr)
+                            candidate = addr
+            if candidate:
+                answer = f"Address: {candidate}"
+                related_docs = self.find_related_documents(query, max_results=10)
+                return {
+                    'query': query,
+                    'answer': answer,
+                    'search_results': search_results,
+                    'related_documents': related_docs,
+                    'num_results': len(search_results),
+                    'num_relationships': len(related_docs)
+                }
         
         # Find related documents
         related_docs = self.find_related_documents(query, max_results=10)
