@@ -24,10 +24,10 @@ def initialize_system():
     if rag_system is None:
         print("🔧 Initializing Graph RAG System...")
         api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
-        rag_system = GraphRAGSystem(api_key)
-        rag_system.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
+        use_ai = bool(api_key)
+        rag_system = GraphRAGSystem(api_key, use_ai=use_ai)
+        # Build using directories so any files you add are ingested automatically
+        rag_system.build_system("data/excel", "data/pdfs")
         print("✅ System initialized successfully!")
 
 @app.route('/api/reload', methods=['POST'])
@@ -37,11 +37,10 @@ def reload_system():
         global rag_system
         print("🔄 Reloading Graph RAG System...")
         api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+        use_ai = bool(api_key)
         # Recreate the system to ensure a clean rebuild
-        rag_system = GraphRAGSystem(api_key)
-        rag_system.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
+        rag_system = GraphRAGSystem(api_key, use_ai=use_ai)
+        rag_system.build_system("data/excel", "data/pdfs")
         print("✅ Reload completed!")
         return jsonify({"success": True}), 200
     except Exception as e:

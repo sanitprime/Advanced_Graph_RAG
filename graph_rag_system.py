@@ -24,19 +24,25 @@ from concurrent.futures import ThreadPoolExecutor
 from unicodedata import normalize as ucnorm
 
 logger = logging.getLogger(__name__)
+# Ensure INFO-level logs are printed to the console so long-running steps show progress
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 class Config:
     CHUNK_SIZE = 1200
     OVERLAP = 250
     BM25_K1 = 1.5
     BM25_B = 0.75
+    # Claude API safeguards
+    CLAUDE_TIMEOUT_SECONDS = 8
+    CLAUDE_MAX_RETRIES = 1
 
 class PDFProcessor:
     """Dynamic PDF processing with AI-powered document type detection and field extraction"""
     
-    def __init__(self, claude_api_key=None):
-        self.claude_api_key = claude_api_key
-        if claude_api_key:
+    def __init__(self, claude_api_key=None, use_ai: bool = True):
+        self.claude_api_key = claude_api_key if use_ai else None
+        if use_ai and claude_api_key:
             self.claude_client = Anthropic(api_key=claude_api_key)
         else:
             self.claude_client = None
@@ -145,7 +151,7 @@ Please extract the following information in JSON format. If a field is not found
 
 Return ONLY a valid JSON object with the extracted fields. If a field is not found, use null."""
 
-        max_retries = 3
+        max_retries = Config.CLAUDE_MAX_RETRIES
         retry_delay = 2
         
         for attempt in range(max_retries):
@@ -193,7 +199,7 @@ Return ONLY a valid JSON object with the extracted fields. If a field is not fou
                 max_tokens=1000,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return fut.result(timeout=30)
+            return fut.result(timeout=Config.CLAUDE_TIMEOUT_SECONDS)
     
     def _extract_basic_fields(self, text: str, doc_type: str) -> Dict[str, Any]:
         """Fallback basic field extraction using regex patterns"""
@@ -574,13 +580,13 @@ class GraphRelationshipBuilder:
 class GraphRAGSystem:
     """Main Graph RAG System with Excel + PDF Integration"""
     
-    def __init__(self, claude_api_key: str = None):
-        self.claude_api_key = claude_api_key
-        self.pdf_processor = PDFProcessor(claude_api_key)
+    def __init__(self, claude_api_key: str = None, use_ai: bool = True):
+        self.claude_api_key = claude_api_key if use_ai else None
+        self.pdf_processor = PDFProcessor(self.claude_api_key, use_ai=use_ai)
         self.graph_builder = GraphRelationshipBuilder()
         self.faiss_index = None
         self.metadata_list = None
-        self.claude_client = Anthropic(api_key=claude_api_key) if claude_api_key else None
+        self.claude_client = Anthropic(api_key=claude_api_key) if (use_ai and claude_api_key) else None
         self.df = None
         self.graph = None
         self.entities = []
@@ -596,9 +602,39 @@ class GraphRAGSystem:
         self._bm25_avgdl = 0.0
         
     def load_excel_data(self, excel_path: str):
-        """Load Excel data"""
+        """Load Excel data from a single file or all files in a directory.
+
+        If a directory path is provided, reads all .xlsx/.xls/.csv files
+        and concatenates them into a single DataFrame, adding a `_source_file`
+        column to retain provenance for each row.
+        """
         logger.info("📊 Loading Excel data...")
-        self.df = pd.read_excel(excel_path)
+        if os.path.isdir(excel_path):
+            excel_files = []
+            for root, _, files in os.walk(excel_path):
+                for f in files:
+                    if f.lower().endswith((".xlsx", ".xls", ".csv")):
+                        excel_files.append(os.path.join(root, f))
+            if not excel_files:
+                raise FileNotFoundError(f"No Excel/CSV files found in directory: {excel_path}")
+            frames = []
+            for fp in excel_files:
+                try:
+                    if fp.lower().endswith(".csv"):
+                        df_part = pd.read_csv(fp)
+                    else:
+                        df_part = pd.read_excel(fp)
+                    df_part["_source_file"] = os.path.basename(fp)
+                    frames.append(df_part)
+                    logger.info(f"  ✅ Loaded '{os.path.basename(fp)}' with {len(df_part)} rows")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ Skipping '{fp}' due to error: {e}")
+            if not frames:
+                raise ValueError(f"No readable Excel/CSV files in directory: {excel_path}")
+            self.df = pd.concat(frames, ignore_index=True)
+        else:
+            self.df = pd.read_excel(excel_path)
+            self.df["_source_file"] = os.path.basename(excel_path)
         # Normalize key text fields to avoid unicode/whitespace mismatches
         def _norm_text(val: Any) -> Any:
             if pd.isna(val):
@@ -708,9 +744,10 @@ class GraphRAGSystem:
                 f"Supplier: {supplier} | Customer: {customer} | Book: {title} | "
                 f"Total Purchase amount: {total_purchase} | PO: {po} | GRN: {grn}"
             )
+            source_file = str(row.get('_source_file', 'excel'))
             chunk = {
                 'id': f"excel_row_{idx}",
-                'source': 'ABC_Book_Stores_Inventory_Register.xlsx',
+                'source': source_file,
                 'type': 'excel',
                 'document_type': 'inventory_register',
                 'row_index': idx,
@@ -761,7 +798,7 @@ class GraphRAGSystem:
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         texts = [chunk['text'] for chunk in all_chunks]
         # Batch encode and L2-normalize for cosine/IP search
-        embeddings = self.model.encode(texts, batch_size=128, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+        embeddings = self.model.encode(texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True).astype("float32")
         # Normalize to unit length
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
         embeddings = embeddings / norms
