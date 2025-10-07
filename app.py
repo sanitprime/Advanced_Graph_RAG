@@ -27,7 +27,7 @@ def initialize_system():
         use_ai = bool(api_key)
         rag_system = GraphRAGSystem(api_key, use_ai=use_ai)
         # Build using directories so any files you add are ingested automatically
-        rag_system.build_system("data/excel", "data/pdfs")
+        rag_system.build_system("data/excel", "data")
         print("✅ System initialized successfully!")
 
 @app.route('/api/reload', methods=['POST'])
@@ -40,9 +40,27 @@ def reload_system():
         use_ai = bool(api_key)
         # Recreate the system to ensure a clean rebuild
         rag_system = GraphRAGSystem(api_key, use_ai=use_ai)
-        rag_system.build_system("data/excel", "data/pdfs")
+        rag_system.build_system("data/excel", "data")
         print("✅ Reload completed!")
         return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clear-cache', methods=['POST'])
+def clear_cache():
+    """Clear all cached data"""
+    try:
+        global rag_system
+        if rag_system is None:
+            # Initialize system if not already done
+            initialize_system()
+        
+        result = rag_system.clear_cache()
+        if result.get("success"):
+            print("🗑️ Cache cleared successfully!")
+            return jsonify({"success": True, "message": "Cache cleared successfully"}), 200
+        else:
+            return jsonify({"success": False, "error": result.get("error", "Unknown error")}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

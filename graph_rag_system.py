@@ -13,6 +13,9 @@ import time
 import fitz  # PyMuPDF
 import uuid
 import re
+import hashlib
+import pickle
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 from sentence_transformers import SentenceTransformer
 import faiss
@@ -36,9 +39,101 @@ class Config:
     # Claude API safeguards
     CLAUDE_TIMEOUT_SECONDS = 8
     CLAUDE_MAX_RETRIES = 1
+    # Caching
+    CACHE_DIR = "cache"
+    CACHE_VERSION = "1.0"
 
-class PDFProcessor:
-    """Dynamic PDF processing with AI-powered document type detection and field extraction"""
+class CacheManager:
+    """Manages caching for processed documents to avoid reprocessing"""
+    
+    def __init__(self, cache_dir: str = Config.CACHE_DIR):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        
+    def _get_file_hash(self, file_path: str) -> str:
+        """Get hash of file based on path and modification time"""
+        try:
+            stat = os.stat(file_path)
+            # Include file path, size, and modification time in hash
+            content = f"{file_path}_{stat.st_size}_{stat.st_mtime}"
+            return hashlib.md5(content.encode()).hexdigest()
+        except OSError:
+            return None
+    
+    def _get_cache_path(self, cache_key: str) -> str:
+        """Get cache file path for a given key"""
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
+    
+    def get_cached_data(self, cache_key: str) -> Optional[Any]:
+        """Retrieve cached data if it exists and is valid"""
+        cache_path = self._get_cache_path(cache_key)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    # Check if cache version matches
+                    if cached_data.get('version') == Config.CACHE_VERSION:
+                        logger.info(f"✅ Using cached data for {cache_key}")
+                        return cached_data.get('data')
+                    else:
+                        logger.info(f"🔄 Cache version mismatch for {cache_key}, rebuilding...")
+                        os.remove(cache_path)
+            except Exception as e:
+                logger.warning(f"⚠️ Error loading cache for {cache_key}: {e}")
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+        return None
+    
+    def set_cached_data(self, cache_key: str, data: Any) -> None:
+        """Store data in cache"""
+        cache_path = self._get_cache_path(cache_key)
+        try:
+            cache_data = {
+                'version': Config.CACHE_VERSION,
+                'timestamp': datetime.now().isoformat(),
+                'data': data
+            }
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            logger.info(f"💾 Cached data for {cache_key}")
+        except Exception as e:
+            logger.warning(f"⚠️ Error caching data for {cache_key}: {e}")
+    
+    def get_file_cache_key(self, file_path: str) -> str:
+        """Generate cache key for a file"""
+        file_hash = self._get_file_hash(file_path)
+        if file_hash:
+            return f"file_{file_hash}"
+        return f"file_{os.path.basename(file_path)}"
+    
+    def get_directory_cache_key(self, dir_path: str) -> str:
+        """Generate cache key for a directory based on all files in it"""
+        file_hashes = []
+        for root, dirs, files in os.walk(dir_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_hash = self._get_file_hash(file_path)
+                if file_hash:
+                    file_hashes.append(file_hash)
+        
+        if file_hashes:
+            # Sort to ensure consistent hash regardless of file order
+            combined_hash = hashlib.md5(''.join(sorted(file_hashes)).encode()).hexdigest()
+            return f"dir_{combined_hash}"
+        return f"dir_{os.path.basename(dir_path)}"
+    
+    def clear_cache(self) -> None:
+        """Clear all cached data"""
+        try:
+            for file in os.listdir(self.cache_dir):
+                if file.endswith('.pkl'):
+                    os.remove(os.path.join(self.cache_dir, file))
+            logger.info("🗑️ Cache cleared")
+        except Exception as e:
+            logger.warning(f"⚠️ Error clearing cache: {e}")
+
+class GenericFileProcessor:
+    """Generic file processor that can handle any file type with AI-powered content extraction"""
     
     def __init__(self, claude_api_key=None, use_ai: bool = True):
         self.claude_api_key = claude_api_key if use_ai else None
@@ -48,11 +143,43 @@ class PDFProcessor:
             self.claude_client = None
         self.document_types = {}  # Will be populated dynamically
         self.field_patterns = {}  # Will be learned dynamically
+        self.supported_extensions = {
+            '.pdf': self._process_pdf,
+            '.txt': self._process_text,
+            '.docx': self._process_docx,
+            '.doc': self._process_doc,
+            '.xlsx': self._process_excel,
+            '.xls': self._process_excel,
+            '.csv': self._process_csv,
+            '.json': self._process_json,
+            '.xml': self._process_xml,
+            '.html': self._process_html,
+            '.md': self._process_markdown,
+            '.rtf': self._process_rtf,
+            '.odt': self._process_odt
+        }
     
-    def extract_pdf_text(self, pdf_path: str) -> str:
+    def process_file(self, file_path: str) -> Dict[str, Any]:
+        """Process any file type and return extracted content and metadata"""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
+        
+        if file_ext in self.supported_extensions:
+            try:
+                logger.info(f"  📄 Processing {filename} as {file_ext} file...")
+                processor_func = self.supported_extensions[file_ext]
+                return processor_func(file_path)
+            except Exception as e:
+                logger.warning(f"  ⚠️ Error processing {filename}: {e}")
+                return self._process_generic(file_path)
+        else:
+            logger.info(f"  📄 Processing {filename} as generic file...")
+            return self._process_generic(file_path)
+    
+    def _process_pdf(self, file_path: str) -> Dict[str, Any]:
         """Extract text from PDF with error handling"""
         try:
-            doc = fitz.open(pdf_path)
+            doc = fitz.open(file_path)
             text_parts = []
             
             for page_num, page in enumerate(doc):
@@ -61,63 +188,331 @@ class PDFProcessor:
                     text_parts.append(f"Page {page_num + 1}:\n{page_text}")
             
             doc.close()
-            return "\n\n".join(text_parts)
+            text = "\n\n".join(text_parts)
+            return {
+                'content': text,
+                'file_type': 'pdf',
+                'metadata': {
+                    'pages': len(text_parts),
+                    'total_chars': len(text)
+                }
+            }
         except Exception as e:
-            logger.error(f"Error extracting text from {pdf_path}: {e}")
-            return ""
+            logger.error(f"Error extracting text from {file_path}: {e}")
+            return {'content': '', 'file_type': 'pdf', 'metadata': {'error': str(e)}}
     
-    def detect_document_type(self, text: str, filename: str) -> str:
-        """AI-powered document type detection"""
+    def _process_text(self, file_path: str) -> Dict[str, Any]:
+        """Process plain text files"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return {
+                'content': content,
+                'file_type': 'text',
+                'metadata': {'total_chars': len(content)}
+            }
+        except UnicodeDecodeError:
+            try:
+                with open(file_path, 'r', encoding='latin-1') as f:
+                    content = f.read()
+                return {
+                    'content': content,
+                    'file_type': 'text',
+                    'metadata': {'total_chars': len(content), 'encoding': 'latin-1'}
+                }
+            except Exception as e:
+                return {'content': '', 'file_type': 'text', 'metadata': {'error': str(e)}}
+    
+    def _process_excel(self, file_path: str) -> Dict[str, Any]:
+        """Process Excel files (will be handled separately in load_excel_data)"""
+        return {'content': '', 'file_type': 'excel', 'metadata': {'note': 'Processed separately'}}
+    
+    def _process_csv(self, file_path: str) -> Dict[str, Any]:
+        """Process CSV files (will be handled separately in load_excel_data)"""
+        return {'content': '', 'file_type': 'csv', 'metadata': {'note': 'Processed separately'}}
+    
+    def _process_json(self, file_path: str) -> Dict[str, Any]:
+        """Process JSON files"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Convert JSON to readable text
+            content = json.dumps(data, indent=2)
+            return {
+                'content': content,
+                'file_type': 'json',
+                'metadata': {'structure': data, 'total_chars': len(content)}
+            }
+        except Exception as e:
+            return {'content': '', 'file_type': 'json', 'metadata': {'error': str(e)}}
+    
+    def _process_xml(self, file_path: str) -> Dict[str, Any]:
+        """Process XML files"""
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            # Convert XML to readable text
+            content = ET.tostring(root, encoding='unicode')
+            return {
+                'content': content,
+                'file_type': 'xml',
+                'metadata': {'root_tag': root.tag, 'total_chars': len(content)}
+            }
+        except Exception as e:
+            return {'content': '', 'file_type': 'xml', 'metadata': {'error': str(e)}}
+    
+    def _process_html(self, file_path: str) -> Dict[str, Any]:
+        """Process HTML files"""
+        try:
+            from bs4 import BeautifulSoup
+            with open(file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # Extract text content
+            text_content = soup.get_text()
+            
+            return {
+                'content': text_content,
+                'file_type': 'html',
+                'metadata': {'title': soup.title.string if soup.title else None, 'total_chars': len(text_content)}
+            }
+        except ImportError:
+            # Fallback without BeautifulSoup
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                return {
+                    'content': content,
+                    'file_type': 'html',
+                    'metadata': {'total_chars': len(content), 'note': 'Raw HTML'}
+                }
+            except Exception as e:
+                return {'content': '', 'file_type': 'html', 'metadata': {'error': str(e)}}
+        except Exception as e:
+            return {'content': '', 'file_type': 'html', 'metadata': {'error': str(e)}}
+    
+    def _process_markdown(self, file_path: str) -> Dict[str, Any]:
+        """Process Markdown files"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return {
+                'content': content,
+                'file_type': 'markdown',
+                'metadata': {'total_chars': len(content)}
+            }
+        except Exception as e:
+            return {'content': '', 'file_type': 'markdown', 'metadata': {'error': str(e)}}
+    
+    def _process_docx(self, file_path: str) -> Dict[str, Any]:
+        """Process DOCX files"""
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            paragraphs = [p.text for p in doc.paragraphs]
+            content = '\n'.join(paragraphs)
+            
+            return {
+                'content': content,
+                'file_type': 'docx',
+                'metadata': {'paragraphs': len(paragraphs), 'total_chars': len(content)}
+            }
+        except ImportError:
+            return {'content': '', 'file_type': 'docx', 'metadata': {'error': 'python-docx not installed'}}
+        except Exception as e:
+            return {'content': '', 'file_type': 'docx', 'metadata': {'error': str(e)}}
+    
+    def _process_doc(self, file_path: str) -> Dict[str, Any]:
+        """Process DOC files (legacy Word format)"""
+        try:
+            # Try to convert to text using antiword or similar
+            import subprocess
+            result = subprocess.run(['antiword', file_path], capture_output=True, text=True)
+            if result.returncode == 0:
+                return {
+                    'content': result.stdout,
+                    'file_type': 'doc',
+                    'metadata': {'total_chars': len(result.stdout)}
+                }
+            else:
+                raise Exception("antiword failed")
+        except (ImportError, FileNotFoundError, Exception):
+            return {'content': '', 'file_type': 'doc', 'metadata': {'error': 'DOC processing requires antiword'}}
+    
+    def _process_rtf(self, file_path: str) -> Dict[str, Any]:
+        """Process RTF files"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # Basic RTF text extraction (remove RTF markup)
+            import re
+            clean_text = re.sub(r'\\[a-z]+\d*\s?', '', content)
+            clean_text = re.sub(r'[{}]', '', clean_text)
+            
+            return {
+                'content': clean_text,
+                'file_type': 'rtf',
+                'metadata': {'total_chars': len(clean_text)}
+            }
+        except Exception as e:
+            return {'content': '', 'file_type': 'rtf', 'metadata': {'error': str(e)}}
+    
+    def _process_odt(self, file_path: str) -> Dict[str, Any]:
+        """Process ODT files (OpenDocument Text)"""
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            
+            with zipfile.ZipFile(file_path, 'r') as odt:
+                content_xml = odt.read('content.xml')
+                root = ET.fromstring(content_xml)
+                
+                # Extract text from OpenDocument format
+                text_parts = []
+                for elem in root.iter():
+                    if elem.text:
+                        text_parts.append(elem.text)
+                
+                content = ' '.join(text_parts)
+                return {
+                    'content': content,
+                    'file_type': 'odt',
+                    'metadata': {'total_chars': len(content)}
+                }
+        except Exception as e:
+            return {'content': '', 'file_type': 'odt', 'metadata': {'error': str(e)}}
+    
+    def _process_generic(self, file_path: str) -> Dict[str, Any]:
+        """Process unknown file types as binary or text"""
+        try:
+            # Try to read as text first
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return {
+                'content': content,
+                'file_type': 'text',
+                'metadata': {'total_chars': len(content), 'note': 'Processed as text'}
+            }
+        except UnicodeDecodeError:
+            # Try different encoding
+            try:
+                with open(file_path, 'r', encoding='latin-1') as f:
+                    content = f.read()
+                return {
+                    'content': content,
+                    'file_type': 'text',
+                    'metadata': {'total_chars': len(content), 'encoding': 'latin-1', 'note': 'Processed as text'}
+                }
+            except Exception:
+                # Binary file
+                try:
+                    with open(file_path, 'rb') as f:
+                        data = f.read()
+                    return {
+                        'content': f"[Binary file - {len(data)} bytes]",
+                        'file_type': 'binary',
+                        'metadata': {'size': len(data), 'note': 'Binary file'}
+                    }
+                except Exception as e:
+                    return {'content': '', 'file_type': 'unknown', 'metadata': {'error': str(e)}}
+        except Exception as e:
+            return {'content': '', 'file_type': 'unknown', 'metadata': {'error': str(e)}}
+    
+    def detect_document_type(self, text: str, filename: str, file_type: str = None) -> str:
+        """AI-powered generic document type detection"""
         if not self.claude_client:
             # Fallback to simple pattern matching
-            text_lower = text.lower()
-            filename_lower = filename.lower()
-            
-            if 'grn' in filename_lower or 'goods receipt' in text_lower:
-                return 'grn'
-            elif 'invoice' in filename_lower or 'inv-' in filename_lower or 'bill' in text_lower:
-                return 'invoice'
-            elif 'po-' in filename_lower or 'purchase order' in text_lower:
-                return 'purchase_order'
-            elif 'proforma' in text_lower or 'pi-' in filename_lower:
-                return 'proforma_invoice'
-            else:
-                return 'unknown'
+            return self._detect_document_type_simple(text, filename, file_type)
         
         # Use Claude for intelligent document type detection
-        prompt = f"""Analyze this document and determine its type. The filename is: {filename}
+        prompt = f"""Analyze this document and determine its type. 
 
-Document content (first 2000 characters):
-{text[:2000]}
+Filename: {filename}
+File Type: {file_type or 'unknown'}
+Content (first 2000 characters): {text[:2000]}
 
-Based on the content and filename, classify this document into one of these categories:
-- grn (Goods Receipt Note)
-- invoice (Invoice/Bill)
-- purchase_order (Purchase Order)
-- proforma_invoice (Proforma Invoice)
-- quotation (Quotation/Quote)
-- delivery_note (Delivery Note)
-- receipt (Receipt)
-- contract (Contract/Agreement)
-- statement (Account Statement)
-- other (Other document type)
+Based on the content and filename, classify this document into the most appropriate category. Consider:
+- Business documents (invoices, receipts, contracts, statements)
+- Technical documents (manuals, specifications, reports)
+- Legal documents (agreements, policies, terms)
+- Academic documents (papers, research, notes)
+- Personal documents (letters, notes, journals)
+- Data files (logs, configurations, databases)
+- Creative documents (stories, articles, presentations)
+- Administrative documents (forms, applications, certificates)
 
-Respond with ONLY the category name, nothing else."""
+Respond with ONLY the most specific category name that fits this document, nothing else."""
 
         try:
             response = self.claude_client.messages.create(
                 model="claude-3-haiku-20240307",
-                max_tokens=50,
+                max_tokens=100,
                 messages=[{"role": "user", "content": prompt}]
             )
             doc_type = response.content[0].text.strip().lower()
-            return doc_type if doc_type in ['grn', 'invoice', 'purchase_order', 'proforma_invoice', 'quotation', 'delivery_note', 'receipt', 'contract', 'statement', 'other'] else 'unknown'
+            # Clean up the response
+            doc_type = re.sub(r'[^\w\s-]', '', doc_type).replace(' ', '_')
+            return doc_type or 'unknown'
         except Exception as e:
             logger.error(f"Error in Claude document type detection: {e}")
-            return 'unknown'
+            return self._detect_document_type_simple(text, filename, file_type)
+    
+    def _detect_document_type_simple(self, text: str, filename: str, file_type: str = None) -> str:
+        """Simple pattern-based document type detection"""
+        text_lower = text.lower()
+        filename_lower = filename.lower()
+        
+        # Common document patterns
+        patterns = {
+            'invoice': ['invoice', 'bill', 'inv-', 'receipt'],
+            'contract': ['contract', 'agreement', 'terms', 'conditions'],
+            'report': ['report', 'summary', 'analysis', 'findings'],
+            'manual': ['manual', 'guide', 'instructions', 'tutorial'],
+            'policy': ['policy', 'procedure', 'guidelines', 'rules'],
+            'letter': ['letter', 'correspondence', 'communication'],
+            'statement': ['statement', 'account', 'balance'],
+            'receipt': ['receipt', 'payment', 'confirmation'],
+            'quotation': ['quotation', 'quote', 'estimate'],
+            'order': ['order', 'purchase', 'po-'],
+            'delivery': ['delivery', 'shipping', 'dispatch'],
+            'certificate': ['certificate', 'certification', 'license'],
+            'application': ['application', 'form', 'request'],
+            'proposal': ['proposal', 'bid', 'tender'],
+            'memo': ['memo', 'memorandum', 'note'],
+            'presentation': ['presentation', 'slides', 'ppt'],
+            'email': ['email', 'message', 'correspondence'],
+            'log': ['log', 'record', 'entry', 'timestamp'],
+            'config': ['config', 'configuration', 'settings'],
+            'data': ['data', 'dataset', 'export', 'import']
+        }
+        
+        # Check filename patterns first
+        for doc_type, keywords in patterns.items():
+            if any(keyword in filename_lower for keyword in keywords):
+                return doc_type
+        
+        # Check content patterns
+        for doc_type, keywords in patterns.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return doc_type
+        
+        # File type based detection
+        if file_type:
+            if file_type in ['json', 'xml']:
+                return 'data'
+            elif file_type in ['html', 'markdown']:
+                return 'web_content'
+            elif file_type == 'csv':
+                return 'spreadsheet'
+        
+        return 'document'
     
     def extract_structured_data(self, text: str, doc_type: str) -> Dict[str, Any]:
-        """AI-powered dynamic field extraction from PDF text"""
+        """AI-powered dynamic field extraction from any document type"""
         if not self.claude_client:
             # Fallback to basic regex patterns
             return self._extract_basic_fields(text, doc_type)
@@ -128,28 +523,20 @@ Respond with ONLY the category name, nothing else."""
 Document content:
 {text[:3000]}
 
-Please extract the following information in JSON format. If a field is not found, use null:
-- document_number (any reference number like GRN, Invoice No, PO No, etc.)
-- date (any date mentioned)
-- amount (any monetary value)
-- supplier_name (vendor/supplier name)
-- customer_name (buyer/customer name)
-- company_name (company issuing the document)
-- address (any address mentioned)
-- phone (phone numbers)
-- email (email addresses)
-- items (list of items/products mentioned)
-- quantity (quantities mentioned)
-- unit_price (unit prices)
-- total_amount (total monetary value)
-- tax_amount (tax values)
-- due_date (payment due date)
-- payment_terms (payment terms)
-- shipping_address (delivery address)
-- billing_address (billing address)
-- notes (any additional notes or comments)
+Analyze the document and extract any structured information you can find. Look for:
+- Identifiers (reference numbers, IDs, codes)
+- Dates (creation dates, due dates, timestamps)
+- Names (people, companies, organizations)
+- Addresses (physical addresses, email addresses)
+- Contact information (phone numbers, emails)
+- Financial information (amounts, prices, costs)
+- Items/Products (lists, descriptions, quantities)
+- Status information (states, conditions, results)
+- Categories (types, classifications, tags)
+- Relationships (connections, dependencies, hierarchies)
+- Any other structured data that might be useful
 
-Return ONLY a valid JSON object with the extracted fields. If a field is not found, use null."""
+Return ONLY a valid JSON object with the extracted fields. Use descriptive field names based on the content. If a field is not found, use null."""
 
         max_retries = Config.CLAUDE_MAX_RETRIES
         retry_delay = 2
@@ -258,47 +645,93 @@ class GraphRelationshipBuilder:
         return s
         
     def extract_entities_from_excel(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Extract entities from Excel data"""
+        """Extract entities from Excel data dynamically based on actual column names"""
         entities = []
         
+        # Dynamic field mapping based on actual column names
+        field_mapping = self._create_dynamic_field_mapping(df.columns)
+        
         for idx, row in df.iterrows():
-            row_entities = {
-                'grn_code': row.get('GRN Code'),
-                'po_number': row.get('Purchase Order No.'),
-                'invoice_number': row.get('Sales Inv No.'),
-                'supplier_name': row.get('Supplier Name'),
-                'customer_name': row.get('Customer Name'),
-                'book_title': row.get('Book Title'),
-                'author': row.get('Author'),
-                'isbn': row.get('ISBN'),
-                'store_location': row.get('Store Location'),
-                'store_code': row.get('Store Code')
-            }
+            row_entities = {}
             
-            for key, value in row_entities.items():
-                if pd.notna(value) and str(value).strip():
-                    entity_id = f"excel_{key}_{idx}_{str(value).replace(' ', '_')}"
+            # Dynamically extract entities from all columns
+            for col_name, col_value in row.items():
+                if pd.notna(col_value) and str(col_value).strip():
+                    # Map column name to entity type
+                    entity_type = field_mapping.get(col_name, col_name.lower().replace(' ', '_').replace('.', ''))
+                    
+                    # Create normalized key for entity type
+                    entity_key = entity_type
+                    
+                    if entity_key not in row_entities:
+                        row_entities[entity_key] = col_value
+                    
+                    # Create entity
+                    entity_id = f"excel_{entity_key}_{idx}_{str(col_value).replace(' ', '_')}"
                     entities.append({
                         'id': entity_id,
-                        'name': str(value),
-                        'type': key,
+                        'name': str(col_value),
+                        'type': entity_key,
                         'source': 'excel',
                         'row_index': idx,
                         'attributes': {
-                            'source_file': 'ABC_Book_Stores_Inventory_Register.xlsx',
+                            'source_file': row.get('_source_file', 'excel_data'),
                             'row_index': idx,
-                            'column': key
+                            'column': col_name,
+                            'original_column': col_name
                         }
                     })
                     
                     self.entity_map[entity_id] = {
-                        'name': str(value),
-                        'type': key,
+                        'name': str(col_value),
+                        'type': entity_key,
                         'source': 'excel',
-                        'row_index': idx
+                        'row_index': idx,
+                        'original_column': col_name
                     }
         
         return entities
+    
+    def _create_dynamic_field_mapping(self, columns: List[str]) -> Dict[str, str]:
+        """Create dynamic field mapping based on actual column names"""
+        mapping = {}
+        
+        # Common patterns for entity type detection
+        patterns = {
+            'grn_code': ['grn', 'goods receipt'],
+            'po_number': ['purchase order', 'po'],
+            'invoice_number': ['invoice', 'inv', 'sales inv'],
+            'supplier_name': ['supplier', 'vendor'],
+            'customer_name': ['customer', 'buyer', 'client'],
+            'book_title': ['book title', 'title', 'product'],
+            'author': ['author', 'writer'],
+            'isbn': ['isbn'],
+            'store_location': ['store location', 'location', 'branch'],
+            'store_code': ['store code', 'branch code'],
+            'amount': ['amount', 'price', 'cost', 'total'],
+            'quantity': ['quantity', 'qty', 'count'],
+            'date': ['date', 'created', 'updated'],
+            'status': ['status', 'state'],
+            'category': ['category', 'type', 'class']
+        }
+        
+        for col in columns:
+            col_lower = col.lower().strip()
+            
+            # Find best matching pattern
+            best_match = None
+            for entity_type, keywords in patterns.items():
+                if any(keyword in col_lower for keyword in keywords):
+                    best_match = entity_type
+                    break
+            
+            # If no pattern matches, create a normalized name
+            if not best_match:
+                best_match = col_lower.replace(' ', '_').replace('.', '').replace('-', '_')
+            
+            mapping[col] = best_match
+        
+        return mapping
     
     def extract_entities_from_pdf(self, pdf_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Dynamic entity extraction from PDF documents"""
@@ -376,7 +809,7 @@ class GraphRelationshipBuilder:
         return field_mapping.get(field_name, f"{doc_type}_{field_name}")
     
     def build_relationships(self, excel_entities: List[Dict], pdf_entities: List[Dict]) -> List[Dict[str, Any]]:
-        """Efficient relationship building using indexed joins to avoid cross-product scans."""
+        """Dynamic relationship building using semantic similarity and flexible type matching."""
         relationships = []
         
         # Build indexes: (type, normalized_name) -> [entities]
@@ -385,35 +818,50 @@ class GraphRelationshipBuilder:
             key = (e['type'], self._normalize_name(e['name']))
             pdf_index[key].append(e)
         
-        # Similar/compatible types mapping
-        similar_types = {
-            'document_number': {'grn_code', 'invoice_number', 'po_number', 'quote_number', 'document_number'},
-            'supplier_name': {'vendor_name', 'company_name', 'supplier_name'},
-            'customer_name': {'buyer_name', 'customer_name'},
-            'amount': {'total_amount', 'amount'},
-            'date': {'grn_date', 'invoice_date', 'po_date', 'due_date', 'date'}
-        }
+        # Dynamic type similarity detection
+        def get_similar_types(entity_type: str) -> List[str]:
+            """Find similar entity types based on semantic similarity"""
+            similar_types = set([entity_type])  # Always include exact match
+            
+            # Extract base words from entity type
+            type_words = set(entity_type.lower().split('_'))
+            
+            # Find other types that share common words
+            all_types = set()
+            for entity in excel_entities + pdf_entities:
+                all_types.add(entity['type'])
+            
+            for other_type in all_types:
+                other_words = set(other_type.lower().split('_'))
+                # If they share significant words, consider them similar
+                if len(type_words.intersection(other_words)) > 0:
+                    similar_types.add(other_type)
+            
+            return list(similar_types)
         
-        def candidate_pdf_types(excel_type: str) -> List[str]:
-            if excel_type in similar_types:
-                return list(similar_types[excel_type])
-            # Also allow exact type matches by default
-            return [excel_type]
-        
-        # Join by normalized name across compatible types
-        for ex in excel_entities:
-            ex_name_norm = self._normalize_name(ex['name'])
-            if not ex_name_norm:
+        # Build relationships between Excel and PDF entities
+        for excel_entity in excel_entities:
+            excel_name_norm = self._normalize_name(excel_entity['name'])
+            if not excel_name_norm:
                 continue
-            for pdf_t in candidate_pdf_types(ex['type']):
-                for pdf_entity in pdf_index.get((pdf_t, ex_name_norm), []):
-                    relationship_type = self._get_relationship_type(ex['type'], pdf_entity['type'])
+                
+            # Find similar PDF entity types
+            similar_pdf_types = get_similar_types(excel_entity['type'])
+            
+            for pdf_type in similar_pdf_types:
+                for pdf_entity in pdf_index.get((pdf_type, excel_name_norm), []):
+                    relationship_type = self._get_relationship_type(excel_entity['type'], pdf_entity['type'])
+                    strength = self._calculate_relationship_strength(
+                        excel_entity['name'], pdf_entity['name'], 
+                        excel_entity['type'], pdf_entity['type']
+                    )
+                    
                     relationships.append({
-                        'from': ex['id'],
+                        'from': excel_entity['id'],
                         'to': pdf_entity['id'],
                         'type': relationship_type,
-                        'strength': 1.0,
-                        'description': f"Excel {ex['type']} '{ex['name']}' relates to PDF {pdf_entity['type']} '{pdf_entity['name']}'"
+                        'strength': strength,
+                        'description': f"Excel {excel_entity['type']} '{excel_entity['name']}' relates to PDF {pdf_entity['type']} '{pdf_entity['name']}'"
                     })
         
         # Create relationships within Excel/PDF data using star topology
@@ -446,24 +894,39 @@ class GraphRelationshipBuilder:
         return False
     
     def _get_relationship_type(self, excel_type: str, pdf_type: str) -> str:
-        """Get the relationship type between two entity types"""
+        """Dynamically determine relationship type between two entity types"""
         if excel_type == pdf_type:
             return f"SAME_{excel_type.upper()}"
         
-        # Map to common relationship types
-        type_mapping = {
-            ('document_number', 'grn_code'): 'SAME_DOCUMENT_REFERENCE',
-            ('document_number', 'invoice_number'): 'SAME_DOCUMENT_REFERENCE',
-            ('document_number', 'po_number'): 'SAME_DOCUMENT_REFERENCE',
-            ('supplier_name', 'vendor_name'): 'SAME_SUPPLIER',
-            ('customer_name', 'buyer_name'): 'SAME_CUSTOMER',
-            ('amount', 'total_amount'): 'SAME_AMOUNT',
-            ('date', 'grn_date'): 'SAME_DATE',
-            ('date', 'invoice_date'): 'SAME_DATE',
-            ('date', 'po_date'): 'SAME_DATE'
+        # Extract common words between types
+        excel_words = set(excel_type.lower().split('_'))
+        pdf_words = set(pdf_type.lower().split('_'))
+        common_words = excel_words.intersection(pdf_words)
+        
+        if common_words:
+            # Use the most significant common word
+            significant_word = max(common_words, key=len)
+            return f"SAME_{significant_word.upper()}"
+        
+        # Check for semantic similarity patterns
+        similarity_patterns = {
+            ('document', 'reference'): 'SAME_DOCUMENT_REFERENCE',
+            ('supplier', 'vendor'): 'SAME_SUPPLIER',
+            ('customer', 'buyer'): 'SAME_CUSTOMER',
+            ('amount', 'total'): 'SAME_AMOUNT',
+            ('date', 'time'): 'SAME_DATE',
+            ('address', 'location'): 'SAME_ADDRESS',
+            ('phone', 'contact'): 'SAME_CONTACT',
+            ('email', 'contact'): 'SAME_CONTACT'
         }
         
-        return type_mapping.get((excel_type, pdf_type), f"RELATED_{excel_type.upper()}_{pdf_type.upper()}")
+        for (word1, word2), rel_type in similarity_patterns.items():
+            if (word1 in excel_type.lower() and word2 in pdf_type.lower()) or \
+               (word2 in excel_type.lower() and word1 in pdf_type.lower()):
+                return rel_type
+        
+        # Default relationship type
+        return f"RELATED_{excel_type.upper()}_{pdf_type.upper()}"
     
     def _calculate_relationship_strength(self, excel_name: str, pdf_name: str, excel_type: str, pdf_type: str) -> float:
         """Calculate relationship strength between two entities"""
@@ -580,10 +1043,11 @@ class GraphRelationshipBuilder:
 class GraphRAGSystem:
     """Main Graph RAG System with Excel + PDF Integration"""
     
-    def __init__(self, claude_api_key: str = None, use_ai: bool = True):
+    def __init__(self, claude_api_key: str = None, use_ai: bool = True, cache_dir: str = Config.CACHE_DIR):
         self.claude_api_key = claude_api_key if use_ai else None
-        self.pdf_processor = PDFProcessor(self.claude_api_key, use_ai=use_ai)
+        self.file_processor = GenericFileProcessor(self.claude_api_key, use_ai=use_ai)
         self.graph_builder = GraphRelationshipBuilder()
+        self.cache_manager = CacheManager(cache_dir)
         self.faiss_index = None
         self.metadata_list = None
         self.claude_client = Anthropic(api_key=claude_api_key) if (use_ai and claude_api_key) else None
@@ -602,13 +1066,24 @@ class GraphRAGSystem:
         self._bm25_avgdl = 0.0
         
     def load_excel_data(self, excel_path: str):
-        """Load Excel data from a single file or all files in a directory.
+        """Load Excel data from a single file or all files in a directory with caching.
 
         If a directory path is provided, reads all .xlsx/.xls/.csv files
         and concatenates them into a single DataFrame, adding a `_source_file`
         column to retain provenance for each row.
         """
         logger.info("📊 Loading Excel data...")
+        
+        # Check cache first
+        excel_cache_key = self.cache_manager.get_directory_cache_key(excel_path) if os.path.isdir(excel_path) else self.cache_manager.get_file_cache_key(excel_path)
+        cached_df = self.cache_manager.get_cached_data(f"excel_data_{excel_cache_key}")
+        
+        if cached_df is not None:
+            logger.info(f"✅ Using cached Excel data ({len(cached_df)} rows)")
+            self.df = cached_df
+            return self.df
+        
+        # Load data if not cached
         if os.path.isdir(excel_path):
             excel_files = []
             for root, _, files in os.walk(excel_path):
@@ -635,6 +1110,7 @@ class GraphRAGSystem:
         else:
             self.df = pd.read_excel(excel_path)
             self.df["_source_file"] = os.path.basename(excel_path)
+        
         # Normalize key text fields to avoid unicode/whitespace mismatches
         def _norm_text(val: Any) -> Any:
             if pd.isna(val):
@@ -644,54 +1120,83 @@ class GraphRAGSystem:
             s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace
             return s
 
-        for col in [
-            'Supplier Name', 'Customer Name', 'Book Title', 'Author', 'Publisher',
-            'GRN Code', 'Purchase Order No.', 'Sales Inv No.'
-        ]:
-            if col in self.df.columns:
+        # Apply normalization to all text columns (not just hardcoded ones)
+        text_columns = []
+        for col in self.df.columns:
+            if self.df[col].dtype == 'object':  # String columns
+                text_columns.append(col)
+        
+        for col in text_columns:
                 self.df[col] = self.df[col].apply(_norm_text)
+        
+        # Cache the processed data
+        self.cache_manager.set_cached_data(f"excel_data_{excel_cache_key}", self.df)
+        
         logger.info(f"✅ Loaded {len(self.df)} rows with {len(self.df.columns)} columns")
         return self.df
     
-    def load_pdf_documents(self, pdf_folder: str) -> List[Dict[str, Any]]:
-        """Load and process all PDF documents"""
-        logger.info("📄 Loading PDF documents...")
+    def load_documents(self, documents_folder: str) -> List[Dict[str, Any]]:
+        """Load and process all documents of any type with caching"""
+        logger.info("📄 Loading documents...")
         
+        # Check if we have cached data for this directory
+        dir_cache_key = self.cache_manager.get_directory_cache_key(documents_folder)
+        cached_chunks = self.cache_manager.get_cached_data(f"doc_chunks_{dir_cache_key}")
+        
+        if cached_chunks is not None:
+            logger.info(f"✅ Using cached document chunks ({len(cached_chunks)} chunks)")
+            # Rebuild field index from cached data
+            self._rebuild_field_index(cached_chunks)
+            return cached_chunks
+        
+        # No cache found, process files
         all_chunks = []
-        pdf_files = []
+        document_files = []
         
-        for root, dirs, files in os.walk(pdf_folder):
+        # Get all files (not just PDFs)
+        for root, dirs, files in os.walk(documents_folder):
             for file in files:
-                if file.endswith('.pdf'):
-                    pdf_files.append(os.path.join(root, file))
+                # Skip Excel files as they're handled separately
+                if not file.lower().endswith(('.xlsx', '.xls', '.csv')):
+                    document_files.append(os.path.join(root, file))
         
-        logger.info(f"📁 Found {len(pdf_files)} PDF files")
+        logger.info(f"📁 Found {len(document_files)} document files")
         
-        for i, pdf_path in enumerate(pdf_files, 1):
-            filename = os.path.basename(pdf_path)
-            logger.info(f"  📄 Processing {filename} ({i}/{len(pdf_files)})...")
+        # Process each document file
+        for i, doc_path in enumerate(document_files, 1):
+            filename = os.path.basename(doc_path)
+            logger.info(f"  📄 Processing {filename} ({i}/{len(document_files)})...")
             
+            # Check individual file cache
+            file_cache_key = self.cache_manager.get_file_cache_key(doc_path)
+            cached_file_data = self.cache_manager.get_cached_data(f"doc_file_{file_cache_key}")
+            
+            if cached_file_data is not None:
+                logger.info(f"    ✅ Using cached data for {filename}")
+                all_chunks.extend(cached_file_data)
+                continue
+            
+            # Process file if not cached
             try:
-                text = self.pdf_processor.extract_pdf_text(pdf_path)
-                if text:
-                    doc_type = self.pdf_processor.detect_document_type(text, filename)
+                # Use generic file processor
+                file_data = self.file_processor.process_file(doc_path)
+                
+                if file_data.get('content'):
+                    text = file_data['content']
+                    file_type = file_data.get('file_type', 'unknown')
+                    metadata = file_data.get('metadata', {})
+                    
+                    # Detect document type
+                    doc_type = self.file_processor.detect_document_type(text, filename, file_type)
                     logger.info(f"    📋 Document type: {doc_type}")
+                    
+                    # Extract structured data
                     logger.info(f"    🔍 Extracting structured data...")
-                    structured_data = self.pdf_processor.extract_structured_data(text, doc_type)
+                    structured_data = self.file_processor.extract_structured_data(text, doc_type)
                     logger.info(f"    ✅ Processing completed")
-                    # Populate field index for supplier -> address
-                    try:
-                        supplier_name = structured_data.get('supplier_name') if structured_data else None
-                        address_val = structured_data.get('address') if structured_data else None
-                        if supplier_name and address_val:
-                            sup_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(supplier_name).replace('\xa0',' '))).strip().lower()
-                            addr_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(address_val).replace('\xa0',' '))).strip()
-                            if sup_norm and addr_norm:
-                                self.field_index['supplier_to_addresses'][sup_norm].add(addr_norm)
-                    except Exception:
-                        pass
                     
                     # Create overlapping sliding-window chunks over full text
+                    file_chunks = []
                     full_text = text
                     chunk_size = Config.CHUNK_SIZE  # characters
                     overlap = Config.OVERLAP      # characters
@@ -705,27 +1210,60 @@ class GraphRAGSystem:
                             chunk = {
                                 'id': f"{filename}_{j}",
                                 'source': filename,
-                                'type': 'pdf',
+                                'type': 'document',
+                                'file_type': file_type,
                                 'document_type': doc_type,
                                 'text': chunk_text,
                                 'structured_data': structured_data,
+                                'metadata': metadata,
                                 'chunk_index': j,
                                 'total_chunks': None
                             }
-                            all_chunks.append(chunk)
+                            file_chunks.append(chunk)
                             j += 1
                         if end == total_len:
                             break
                         start = end - overlap
+                    
+                    all_chunks.extend(file_chunks)
+                    # Cache individual file data
+                    self.cache_manager.set_cached_data(f"doc_file_{file_cache_key}", file_chunks)
+                    
                 else:
-                    logger.warning(f"    ⚠️  No text extracted from {filename}")
+                    logger.warning(f"    ⚠️  No content extracted from {filename}")
                     continue
                         
             except Exception as e:
-                logger.warning(f"⚠️ Error processing {pdf_path}: {e}")
+                logger.warning(f"⚠️ Error processing {doc_path}: {e}")
         
-        logger.info(f"✅ Created {len(all_chunks)} PDF chunks from {len(pdf_files)} documents")
+        # Rebuild field index from all chunks
+        self._rebuild_field_index(all_chunks)
+        
+        # Cache the entire directory result
+        if all_chunks:
+            self.cache_manager.set_cached_data(f"doc_chunks_{dir_cache_key}", all_chunks)
+        
+        logger.info(f"✅ Created {len(all_chunks)} document chunks from {len(document_files)} files")
         return all_chunks
+    
+    def _rebuild_field_index(self, chunks: List[Dict[str, Any]]) -> None:
+        """Rebuild field index from document chunks"""
+        for chunk in chunks:
+            if chunk.get('structured_data'):
+                structured_data = chunk['structured_data']
+                # Dynamically build field index based on extracted data
+                for field_name, field_value in structured_data.items():
+                    if field_value is not None and str(field_value).strip():
+                        # Create index entries for common field types
+                        if 'name' in field_name.lower() and 'address' in structured_data:
+                            name_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(field_value).replace('\xa0',' '))).strip().lower()
+                            addr_val = structured_data.get('address')
+                            if addr_val:
+                                addr_norm = re.sub(r"\s+", " ", ucnorm('NFKC', str(addr_val).replace('\xa0',' '))).strip()
+                                if name_norm and addr_norm:
+                                    if 'name_to_addresses' not in self.field_index:
+                                        self.field_index['name_to_addresses'] = defaultdict(set)
+                                    self.field_index['name_to_addresses'][name_norm].add(addr_norm)
     
     def create_excel_chunks(self) -> List[Dict]:
         """Create enhanced Excel chunks"""
@@ -758,31 +1296,31 @@ class GraphRAGSystem:
         
         return chunks
     
-    def build_system(self, excel_path: str, pdf_folder: str):
+    def build_system(self, excel_path: str, documents_folder: str):
         """Build the complete system with relationships"""
         logger.info("🔧 Building Graph RAG System...")
         
         # Load data
         self.load_excel_data(excel_path)
-        pdf_chunks = self.load_pdf_documents(pdf_folder)
+        document_chunks = self.load_documents(documents_folder)
         
         # Extract entities
         logger.info("🔍 Extracting entities...")
         excel_entities = self.graph_builder.extract_entities_from_excel(self.df)
-        pdf_entities = self.graph_builder.extract_entities_from_pdf(pdf_chunks)
+        document_entities = self.graph_builder.extract_entities_from_pdf(document_chunks)
         
         logger.info(f"✅ Extracted {len(excel_entities)} Excel entities")
-        logger.info(f"✅ Extracted {len(pdf_entities)} PDF entities")
+        logger.info(f"✅ Extracted {len(document_entities)} document entities")
         
         # Build relationships
         logger.info("🔗 Building relationships...")
-        relationships = self.graph_builder.build_relationships(excel_entities, pdf_entities)
+        relationships = self.graph_builder.build_relationships(excel_entities, document_entities)
         
         logger.info(f"✅ Created {len(relationships)} relationships")
         
         # Create network graph
         logger.info("🕸️ Creating network graph...")
-        all_entities = excel_entities + pdf_entities
+        all_entities = excel_entities + document_entities
         self.graph = self.graph_builder.create_network_graph(all_entities, relationships)
         
         self.entities = all_entities
@@ -793,7 +1331,7 @@ class GraphRAGSystem:
         # Build vector index for semantic search
         logger.info("🔢 Building vector index...")
         excel_chunks = self.create_excel_chunks()
-        all_chunks = excel_chunks + pdf_chunks
+        all_chunks = excel_chunks + document_chunks
         
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         texts = [chunk['text'] for chunk in all_chunks]
@@ -829,7 +1367,7 @@ class GraphRAGSystem:
         # Normalize query to unit length for cosine/IP
         q_norm = np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-12
         q_emb = q_emb / q_norm
-        search_k = max(k * 3, 30)
+        search_k = max(k * 3, 50)
         D, I = self.faiss_index.search(q_emb, search_k)
         
         results = []
@@ -1109,6 +1647,14 @@ Answer:"""
             'num_relationships': len(related_docs)
         }
     
+    def clear_cache(self) -> Dict[str, Any]:
+        """Clear all cached data"""
+        try:
+            self.cache_manager.clear_cache()
+            return {"success": True, "message": "Cache cleared successfully"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
     def get_system_statistics(self) -> Dict[str, Any]:
         """Get comprehensive system statistics"""
         if not self.graph:
@@ -1315,14 +1861,14 @@ def main():
     rag = GraphRAGSystem(claude_api_key)
     
     # Build system
-    excel_path = "data/excel/ABC_Book_Stores_Inventory_Register.xlsx"
-    pdf_folder = "data/pdfs"
+    excel_path = "data/excel"
+    documents_folder = "data"
     
-    if not os.path.exists(excel_path) or not os.path.exists(pdf_folder):
-        logger.error("❌ Required data files not found")
+    if not os.path.exists(excel_path) or not os.path.exists(documents_folder):
+        logger.error("❌ Required data directories not found")
         return
     
-    entities, relationships = rag.build_system(excel_path, pdf_folder)
+    entities, relationships = rag.build_system(excel_path, documents_folder)
     
     # Show statistics
     stats = rag.get_system_statistics()
@@ -1383,7 +1929,7 @@ if __name__ == "__main__":
         logger.info("\n🤖 Running with basic functionality (no AI features)...")
     
     rag = GraphRAGSystem(api_key)
-    rag.build_system("data/excel/ABC_Book_Stores_Inventory_Register.xlsx", "data/pdfs")
+    rag.build_system("data/excel", "data")
 
     stats = rag.get_system_statistics()
     logger.info("\n📈 SYSTEM STATISTICS 📈")
